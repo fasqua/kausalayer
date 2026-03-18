@@ -1,0 +1,39 @@
+# Build artifacts
+/target/
+Cargo.lock
+
+# Environment & secrets
+.env
+*.json
+*.enc
+
+# Wallet files
+wallet.json
+*-wallet.json
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Test artifacts
+*.log
+
+# Backup files
+*.old
+*.bak
+*.backup
+*_old.rs
+*_backup.rs
+
+# Test binaries (internal)
+src/bin/check_*.rs
+src/bin/claim_test.rs
+src/bin/devnet_*.rs
+src/bin/scanner_test.rs

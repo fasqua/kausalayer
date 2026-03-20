@@ -37,3 +37,13 @@ src/bin/check_*.rs
 src/bin/claim_test.rs
 src/bin/devnet_*.rs
 src/bin/scanner_test.rs
+
+# Database
+*.db
+
+# More backup patterns
+*.backup_*
+
+# Test/exploit files
+src/bin/attacker_test.rs
+src/relay/*.backup

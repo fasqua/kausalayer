@@ -10,4 +10,4 @@ pub use stealth::{StealthKeys, StealthAddress, MetaAddress, generate_stealth_key
 pub use fragmenter::{Fragmenter, Fragment, lamports_to_sol, sol_to_lamports};
 pub use builder::{TransactionBuilder, PreparedTransaction, MEMO_PROGRAM_ID};
 pub use scanner::{Scanner, DetectedTransfer, TransferStore};
-pub use wallet::{save_wallet, load_wallet, wallet_exists, get_wallet_path};
+pub use wallet::{save_wallet, load_wallet, wallet_exists, get_wallet_path, EncryptedWallet};

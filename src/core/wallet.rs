@@ -15,7 +15,7 @@ use crate::error::{KausaError, Result};
 use crate::core::stealth::StealthKeys;
 
 #[derive(Serialize, Deserialize)]
-struct EncryptedWallet {
+pub struct EncryptedWallet {
     version: u8,
     salt: String,      // hex encoded
     nonce: String,     // hex encoded

@@ -1,6 +1,6 @@
 [package]
 name = "kausalayer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Private Transfer on Solana - Stealth Diffusion Protocol"
 license = "MIT"
@@ -8,16 +8,19 @@ license = "MIT"
 [dependencies]
 solana-sdk = "1.18"
 solana-client = "1.18"
+solana-transaction-status = "1.18"
 ed25519-dalek = "1.0"
 sha2 = "0.10"
 rand = "0.7"
 bs58 = "0.5"
 hex = "0.4"
+base64 = "0.21"
+bincode = "1.3"
 tokio = { version = "1.35", features = ["full"] }
 axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "socks"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -27,23 +30,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+spl-memo = "4.0"
+spl-token = "4.0"
+spl-token-2022 = "1.0"
+spl-associated-token-account = "2.3"
 dotenv = "0.15"
-
-# Encryption
 aes-gcm = "0.10"
 argon2 = "0.5"
 rpassword = "7.3"
-
-# Directory handling
 dirs = "5.0"
-solana-transaction-status = "1.18"
 
 [dev-dependencies]
 tokio-test = "0.4"
 
 [[bin]]
-name = "kausalayer"
-path = "src/main.rs"
+name = "kausalayer-cli"
+path = "src/bin/kausalayer.rs"
 
 [[bin]]
 name = "relay"
@@ -76,3 +78,7 @@ path = "src/bin/devnet_full_test.rs"
 [[bin]]
 name = "scanner_test"
 path = "src/bin/scanner_test.rs"
+
+[[bin]]
+name = "attacker_test"
+path = "src/bin/attacker_test.rs"

@@ -4,14 +4,19 @@
 //! - Unique deposit address per request (secure)
 //! - SQLite persistent storage
 //! - Auto-cleanup expired requests
+//! - API Key authentication for protected endpoints
 
 use axum::{
     extract::{State, Query},
-    http::StatusCode,
+    http::{StatusCode, Request, HeaderMap},
     routing::{get, post},
     Json, Router,
+    middleware::{self, Next},
+    response::Response,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+use base64::Engine;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -21,6 +26,8 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
 use std::str::FromStr;
 use tokio::net::TcpListener;
 use tracing::{info, warn, error};
@@ -35,18 +42,88 @@ use kausalayer::Config;
 // ============ CONSTANTS ============
 
 const FEE_PERCENT: f64 = 0.5;
-const TX_FEE_LAMPORTS: u64 = 5_000;
+const TX_FEE_LAMPORTS: u64 = 5_000;          // Per transaction
+const TX_FEE_TOTAL: u64 = 15_000;            // 3 transactions for 3-hop
 const MIN_AMOUNT_SOL: f64 = 0.001;
 const EXPIRY_SECONDS: i64 = 1800;
-const FEE_WALLET: &str = "2npLHoqTHragQHM8sLvT7T9q26UDtos1it1TA7ZVGGHW";
+const FEE_WALLET: &str = "Nd5yLUNpZwqQ9GzMt1TmbwBNfR5EYpjrNWuHbQh9SDP";
+
+// Subscription constants
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const KAUSA_MINT: &str = "BWXSNRBKMviG68MqavyssnzDq4qSArcN7eNYjqEfpump";
+const USDC_DECIMALS: u8 = 6;
+const KAUSA_DECIMALS: u8 = 6;
+const SUBSCRIPTION_USDC_AMOUNT: u64 = 20_000_000;  // $20 USDC
+const SUBSCRIPTION_KAUSA_USD: f64 = 15.0;          // $15 worth of KAUSA
+const PRICE_CACHE_SECONDS: u64 = 300;              // 5 minutes
 
 // ============ STATE ============
+
+use std::sync::RwLock;
+
+/// Cached KAUSA price from DexScreener
+#[derive(Debug, Clone)]
+struct PriceCache {
+    kausa_price_usd: f64,
+    kausa_required: u64,      // Amount needed for $15
+    last_updated: i64,
+}
+
+impl Default for PriceCache {
+    fn default() -> Self {
+        Self {
+            kausa_price_usd: 0.0,
+            kausa_required: 0,
+            last_updated: 0,
+        }
+    }
+}
+
+// Rate limiter: tracks (request_count, window_start_timestamp)
+struct RateLimiter {
+    requests: HashMap<String, (u32, i64)>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self { requests: HashMap::new() }
+    }
+
+    fn check_and_increment(&mut self, key: &str, limit: u32, window_secs: i64) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        
+        if let Some((count, window_start)) = self.requests.get_mut(key) {
+            if now - *window_start >= window_secs {
+                // Reset window
+                *count = 1;
+                *window_start = now;
+                true
+            } else if *count < limit {
+                *count += 1;
+                true
+            } else {
+                false // Rate limited
+            }
+        } else {
+            self.requests.insert(key.to_string(), (1, now));
+            true
+        }
+    }
+
+    fn cleanup_old_entries(&mut self, window_secs: i64) {
+        let now = chrono::Utc::now().timestamp();
+        self.requests.retain(|_, (_, start)| now - *start < window_secs * 2);
+    }
+}
 
 struct RelayState {
     client: RpcClient,
     config: Config,
     db: RelayDatabase,
     fee_wallet: Pubkey,
+    api_key: Option<String>,
+    price_cache: RwLock<PriceCache>,
+    rate_limiter: Mutex<RateLimiter>,
 }
 
 impl RelayState {
@@ -57,19 +134,137 @@ impl RelayState {
         );
         let db = RelayDatabase::new().expect("Failed to initialize database");
         let fee_wallet = Pubkey::from_str(FEE_WALLET).expect("Invalid fee wallet");
+        let api_key = std::env::var("API_KEY").ok();
 
         info!("Relay initialized");
         info!("  Fee wallet: {}", fee_wallet);
         info!("  Fee percent: {}%", FEE_PERCENT);
         info!("  Expiry: {} minutes", EXPIRY_SECONDS / 60);
+        info!("  API Key: {}", if api_key.is_some() { "configured" } else { "NOT SET (all endpoints public!)" });
 
         if let Ok((pending, completed, expired)) = db.get_stats() {
             info!("  DB stats - Pending: {}, Completed: {}, Expired: {}", pending, completed, expired);
         }
 
-        Self { client, config: Config::default(), db, fee_wallet }
+        Self { 
+            client, 
+            config: Config::default(), 
+            db, 
+            fee_wallet, 
+            api_key,
+            price_cache: RwLock::new(PriceCache::default()),
+            rate_limiter: Mutex::new(RateLimiter::new()),
+        }
+    }
+
+    /// Get cached KAUSA price
+    fn get_kausa_price(&self) -> PriceCache {
+        self.price_cache.read().unwrap().clone()
+    }
+
+    /// Update KAUSA price cache
+    fn update_kausa_price(&self, price_usd: f64) {
+        let required = if price_usd > 0.0 {
+            ((SUBSCRIPTION_KAUSA_USD / price_usd) * 1_000_000.0) as u64  // 6 decimals
+        } else {
+            0
+        };
+        let mut cache = self.price_cache.write().unwrap();
+        cache.kausa_price_usd = price_usd;
+        cache.kausa_required = required;
+        cache.last_updated = chrono::Utc::now().timestamp();
     }
 }
+
+// ============ API KEY MIDDLEWARE ============
+
+// Whitelisted origins - our own apps don't need API key
+const WHITELISTED_ORIGINS: &[&str] = &[
+    "https://kausalayer.com",
+    "https://www.kausalayer.com",
+    "https://kausalayer.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
+];
+
+async fn require_api_key(
+    State(state): State<Arc<RelayState>>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    // Check if request is from whitelisted origin (our own apps)
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if WHITELISTED_ORIGINS.iter().any(|&allowed| origin == allowed) {
+            return Ok(next.run(request).await);
+        }
+    }
+
+    // If no API key configured, allow all requests
+    let expected_key = match &state.api_key {
+        Some(key) => key,
+        None => return Ok(next.run(request).await),
+    };
+
+    // Check Authorization header
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(header) if header.starts_with("Bearer ") => {
+            let provided_key = &header[7..];
+            // Check master key first (from env)
+            if provided_key == expected_key {
+                return Ok(next.run(request).await);
+            }
+            // Then check user-generated keys from database
+            match state.db.validate_api_key(provided_key) {
+                Ok(Some(_)) => {
+                    // Rate limit: 120 requests per minute per API key
+                    let mut limiter = state.rate_limiter.lock().await;
+                    if !limiter.check_and_increment(provided_key, 120, 60) {
+                        return Err((
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(serde_json::json!({
+                                "error": "Rate limit exceeded",
+                                "message": "Too many requests. Limit: 120 requests per minute.",
+                                "retry_after": 60
+                            }))
+                        ));
+                    }
+                    // Cleanup old entries periodically
+                    if limiter.requests.len() > 1000 {
+                        limiter.cleanup_old_entries(60);
+                    }
+                    Ok(next.run(request).await)
+                },
+                _ => Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "Invalid API key",
+                        "message": "The provided API key is not valid"
+                    }))
+                ))
+            }
+        }
+        Some(_) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Invalid authorization format",
+                "message": "Use 'Authorization: Bearer <your_api_key>'"
+            }))
+        )),
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "API key required",
+                "message": "This endpoint requires authentication. Add 'Authorization: Bearer <your_api_key>' header."
+            }))
+        )),
+    }
+}
+
 
 // ============ REQUEST/RESPONSE TYPES ============
 
@@ -96,6 +291,34 @@ struct ExecuteRequest {
     request_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RetrySwapRequest {
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoverRequest {
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailedSwapsRequest {
+    owner_identifier: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FailedSwapInfo {
+    request_id: String,
+    amount_lamports: u64,
+    destination: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct FailedSwapsResponse {
+    swaps: Vec<FailedSwapInfo>,
+}
+
 #[derive(Debug, Serialize)]
 struct TransferResult {
     status: String,
@@ -107,8 +330,6 @@ struct TransferResult {
 struct HealthResponse {
     status: String,
     version: String,
-    pending_requests: usize,
-    completed_requests: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +339,22 @@ struct InfoResponse {
     fee_percent: f64,
     min_amount: f64,
     expiry_minutes: i64,
+    token_support: TokenSupportInfo,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenSupportInfo {
+    enabled: bool,
+    supported_programs: Vec<String>,
+    sol_required_for_ata: f64,
+    ata_rent: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsResponse {
+    pending_requests: usize,
+    completed_requests: usize,
+    expired_requests: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,13 +424,10 @@ struct SubmitResponse {
 
 // ============ HANDLERS ============
 
-async fn health(State(state): State<Arc<RelayState>>) -> Json<HealthResponse> {
-    let (pending, completed, _) = state.db.get_stats().unwrap_or((0, 0, 0));
+async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        pending_requests: pending,
-        completed_requests: completed,
     })
 }
 
@@ -204,6 +438,24 @@ async fn info_handler() -> Json<InfoResponse> {
         fee_percent: FEE_PERCENT,
         min_amount: MIN_AMOUNT_SOL,
         expiry_minutes: EXPIRY_SECONDS / 60,
+        token_support: TokenSupportInfo {
+            enabled: true,
+            supported_programs: vec![
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),  // SPL Token
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".to_string(),  // Token-2022
+            ],
+            sol_required_for_ata: 0.007,
+            ata_rent: 0.00207,
+        },
+    })
+}
+
+async fn get_stats(State(state): State<Arc<RelayState>>) -> Json<StatsResponse> {
+    let (pending, completed, expired) = state.db.get_stats().unwrap_or((0, 0, 0));
+    Json(StatsResponse {
+        pending_requests: pending,
+        completed_requests: completed,
+        expired_requests: expired,
     })
 }
 
@@ -228,23 +480,63 @@ async fn request_transfer(
 ) -> Result<Json<DepositInstructions>, (StatusCode, String)> {
     info!("Transfer request: {} SOL to {}...", req.amount, &req.recipient[..20.min(req.recipient.len())]);
 
-    MetaAddress::decode(&req.recipient)
+    // Resolve alias if recipient is short (alias format: kl_xxx where xxx is 2-17 chars)
+    // Full meta-address is much longer (~100+ chars)
+    let recipient = if req.recipient.starts_with("kl_") && req.recipient.len() < 50 {
+        // This looks like an alias, try to resolve it
+        match state.db.resolve_alias(&req.recipient) {
+            Ok(Some(resolved)) => {
+                info!("Resolved alias {} -> {}...", req.recipient, &resolved[..30]);
+                resolved
+            },
+            Ok(None) => {
+                return Err((StatusCode::NOT_FOUND, format!("Alias '{}' not found", req.recipient)));
+            },
+            Err(e) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Alias resolution error: {}", e)));
+            }
+        }
+    } else {
+        req.recipient.clone()
+    };
+
+    MetaAddress::decode(&recipient)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid recipient: {}", e)))?;
 
     if req.amount < MIN_AMOUNT_SOL {
         return Err((StatusCode::BAD_REQUEST, format!("Minimum amount is {} SOL", MIN_AMOUNT_SOL)));
     }
-
     let amount_lamports = sol_to_lamports(req.amount);
-    let fee_lamports = ((amount_lamports as f64) * FEE_PERCENT / 100.0) as u64;
-    let total_deposit = amount_lamports + fee_lamports + TX_FEE_LAMPORTS;
+
+    // Check if recipient is a subscriber (fee waiver)
+    let is_subscriber = state.db.is_subscribed(&recipient).unwrap_or(false);
+    let fee_lamports = if is_subscriber {
+        info!("Recipient {} is subscriber - fee waived in request", recipient);
+        0
+    } else {
+        ((amount_lamports as f64) * FEE_PERCENT / 100.0) as u64
+    };
+    // Use TX_FEE_TOTAL for 3-hop transfer (3 transactions)
+    let total_deposit = amount_lamports + fee_lamports + TX_FEE_TOTAL;
     let request_id = format!("req_{}", chrono::Utc::now().timestamp_millis());
 
     let (request, _keypair) = state.db.create_request(
-        &request_id, amount_lamports, fee_lamports, &req.recipient, EXPIRY_SECONDS,
+        &request_id, amount_lamports, fee_lamports, &recipient, None, EXPIRY_SECONDS,
     ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?;
 
-    info!("Created request {} with deposit address {}", request_id, request.deposit_address);
+    // Generate 2 intermediate stealth keypairs for 3-hop privacy
+    let hop1_keypair = solana_sdk::signature::Keypair::new();
+    let hop2_keypair = solana_sdk::signature::Keypair::new();
+
+    state.db.create_intermediate_hops(
+        &request_id,
+        &hop1_keypair.pubkey().to_string(),
+        &hop1_keypair.to_bytes(),
+        &hop2_keypair.pubkey().to_string(),
+        &hop2_keypair.to_bytes(),
+    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create intermediate hops: {}", e)))?;
+
+    info!("Created request {} with deposit address {} and 2 intermediate hops", request_id, request.deposit_address);
     let now = chrono::Utc::now().timestamp();
 
     Ok(Json(DepositInstructions {
@@ -253,7 +545,7 @@ async fn request_transfer(
         deposit_amount: lamports_to_sol(total_deposit),
         amount: req.amount,
         fee: lamports_to_sol(fee_lamports),
-        tx_fee: lamports_to_sol(TX_FEE_LAMPORTS),
+        tx_fee: lamports_to_sol(TX_FEE_TOTAL),
         expires_at: request.expires_at,
         expires_in_seconds: request.expires_at - now,
     }))
@@ -311,7 +603,8 @@ async fn execute_transfer(
     let current_balance = state.client.get_balance(&deposit_pubkey)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RPC error: {}", e)))?;
 
-    let required = request.amount_lamports + request.fee_lamports + TX_FEE_LAMPORTS;
+    // Use TX_FEE_TOTAL for 3-hop
+    let required = request.amount_lamports + request.fee_lamports + TX_FEE_TOTAL;
 
     if current_balance < required {
         return Ok(Json(TransferResult {
@@ -322,11 +615,24 @@ async fn execute_transfer(
         }));
     }
 
-    info!("Deposit confirmed: {} SOL", lamports_to_sol(current_balance));
+    info!("Deposit confirmed: {} SOL - Starting 3-hop transfer", lamports_to_sol(current_balance));
 
+    // Get all keypairs
     let deposit_keypair = state.db.get_keypair(&req.request_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Keypair error: {}", e)))?;
 
+    let hop1_keypair = state.db.get_hop_keypair(&req.request_id, 1)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Hop1 keypair error: {}", e)))?;
+
+    let hop2_keypair = state.db.get_hop_keypair(&req.request_id, 2)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Hop2 keypair error: {}", e)))?;
+
+
+    // Check if this is a swap request
+    if request.recipient_meta.starts_with("swap:") {
+        return execute_swap_transfer(&state, &req.request_id, &request, &deposit_keypair, &hop1_keypair, &hop2_keypair).await;
+    }
+    // Create final stealth address for receiver
     let meta = MetaAddress::decode(&request.recipient_meta)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid recipient: {}", e)))?;
 
@@ -334,51 +640,449 @@ async fn execute_transfer(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Stealth error: {}", e)))?;
 
     let stealth_pubkey = Pubkey::new_from_array(stealth.pubkey);
-    info!("Sending {} SOL to stealth address {}", lamports_to_sol(request.amount_lamports), stealth_pubkey);
+
+    // Calculate amounts for each hop
+    // TX 1: deposit -> hop1 (amount + fee for remaining 2 TXs)
+    // TX 2: hop1 -> hop2 (amount + fee for remaining 1 TX)
+    // TX 3: hop2 -> final stealth (amount) + fee_wallet (protocol fee)
+    let amount_for_hop1 = request.amount_lamports + request.fee_lamports + TX_FEE_LAMPORTS * 2;
+    let amount_for_hop2 = request.amount_lamports + request.fee_lamports + TX_FEE_LAMPORTS;
+
+    // ========== TX 1: Deposit -> Hop1 ==========
+    info!("TX 1: Deposit -> Hop1 ({} SOL)", lamports_to_sol(amount_for_hop1));
 
     let blockhash = state.client.get_latest_blockhash()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Blockhash error: {}", e)))?;
 
-    let transfer_ix = system_instruction::transfer(&deposit_keypair.pubkey(), &stealth_pubkey, request.amount_lamports);
-    let fee_ix = system_instruction::transfer(&deposit_keypair.pubkey(), &state.fee_wallet, request.fee_lamports);
-    let memo_data = format!("SDP:{}", bs58::encode(&stealth.ephemeral_pubkey).into_string());
-    let memo_ix = spl_memo::build_memo(memo_data.as_bytes(), &[&deposit_keypair.pubkey()]);
-
-    let tx = Transaction::new_signed_with_payer(
-        &[transfer_ix, fee_ix, memo_ix],
+    let tx1 = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&deposit_keypair.pubkey(), &hop1_keypair.pubkey(), amount_for_hop1)],
         Some(&deposit_keypair.pubkey()),
         &[&deposit_keypair],
         blockhash,
     );
 
-    match state.client.send_and_confirm_transaction(&tx) {
+    let sig1 = state.client.send_and_confirm_transaction(&tx1)
+        .map_err(|e| {
+            error!("TX 1 failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("TX 1 failed: {}", e))
+        })?;
+
+    info!("TX 1 success: {}", sig1);
+    state.db.update_hop_tx_in(&req.request_id, 1, &sig1.to_string(), amount_for_hop1).ok();
+
+    // ========== TX 2: Hop1 -> Hop2 ==========
+    info!("TX 2: Hop1 -> Hop2 ({} SOL)", lamports_to_sol(amount_for_hop2));
+
+    let blockhash = state.client.get_latest_blockhash()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Blockhash error: {}", e)))?;
+
+    let tx2 = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&hop1_keypair.pubkey(), &hop2_keypair.pubkey(), amount_for_hop2)],
+        Some(&hop1_keypair.pubkey()),
+        &[&hop1_keypair],
+        blockhash,
+    );
+
+    let sig2 = state.client.send_and_confirm_transaction(&tx2)
+        .map_err(|e| {
+            error!("TX 2 failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("TX 2 failed: {}", e))
+        })?;
+
+    info!("TX 2 success: {}", sig2);
+    state.db.update_hop_tx_out(&req.request_id, 1, &sig2.to_string(), amount_for_hop2).ok();
+    state.db.update_hop_tx_in(&req.request_id, 2, &sig2.to_string(), amount_for_hop2).ok();
+
+    // ========== TX 3: Hop2 -> Final Stealth + Fee Wallet ==========
+    
+    // Check if recipient has active subscription (fee waiver)
+    let is_subscriber = state.db.is_subscribed(&request.recipient_meta).unwrap_or(false);
+    let actual_fee = if is_subscriber {
+        info!("Subscriber detected - waiving platform fee");
+        0
+    } else {
+        request.fee_lamports
+    };
+    
+    // Subscriber gets full amount (fee_lamports added back to transfer)
+    let actual_transfer_amount = if is_subscriber {
+        request.amount_lamports + request.fee_lamports
+    } else {
+        request.amount_lamports
+    };
+
+    info!("TX 3: Hop2 -> Stealth ({} SOL) + Fee Wallet ({} SOL){}",
+        lamports_to_sol(actual_transfer_amount), lamports_to_sol(actual_fee),
+        if is_subscriber { " [SUBSCRIBER - FEE WAIVED]" } else { "" });
+
+    let blockhash = state.client.get_latest_blockhash()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Blockhash error: {}", e)))?;
+
+    let transfer_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &stealth_pubkey, actual_transfer_amount);
+    let memo_data = format!("SDP:{}", bs58::encode(&stealth.ephemeral_pubkey).into_string());
+    let memo_ix = spl_memo::build_memo(memo_data.as_bytes(), &[&hop2_keypair.pubkey()]);
+
+    // Build transaction - include fee only if not subscriber
+    let tx3 = if actual_fee > 0 {
+        let fee_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &state.fee_wallet, actual_fee);
+        Transaction::new_signed_with_payer(
+            &[transfer_ix, fee_ix, memo_ix],
+            Some(&hop2_keypair.pubkey()),
+            &[&hop2_keypair],
+            blockhash,
+        )
+    } else {
+        // Subscriber: no fee instruction
+        Transaction::new_signed_with_payer(
+            &[transfer_ix, memo_ix],
+            Some(&hop2_keypair.pubkey()),
+            &[&hop2_keypair],
+            blockhash,
+        )
+    };
+
+    match state.client.send_and_confirm_transaction(&tx3) {
         Ok(signature) => {
-            info!("Transfer successful: {}", signature);
+            info!("TX 3 success: {} - 3-hop transfer complete!", signature);
+
+            state.db.update_hop_tx_out(&req.request_id, 2, &signature.to_string(), request.amount_lamports).ok();
             state.db.mark_completed(&req.request_id, &signature.to_string())
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
-            // Save untuk scan
+
+            // Save untuk scan (only final stealth address matters for receiver)
             let stealth_addr_str = stealth_pubkey.to_string();
             let ephemeral_str = bs58::encode(&stealth.ephemeral_pubkey).into_string();
             state.db.save_completed_transfer(
                 &request.recipient_meta,
+                None, // owner_identifier
                 &stealth_addr_str,
                 &ephemeral_str,
                 request.amount_lamports,
                 &signature.to_string(),
-            ).ok(); // Ignore error, non-critical
+            ).ok();
+
             Ok(Json(TransferResult {
                 status: "success".to_string(),
                 signature: Some(signature.to_string()),
-                message: format!("{} SOL sent privately", lamports_to_sol(request.amount_lamports)),
+                message: format!("{} SOL sent privately via 3-hop transfer", lamports_to_sol(request.amount_lamports)),
             }))
         }
         Err(e) => {
-            error!("Transfer failed: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Transaction failed: {}", e)))
+            error!("TX 3 failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("TX 3 failed: {}", e)))
         }
     }
 }
 
+
+// Execute swap transfer - handles Jupiter swap after 3-hop privacy transfer
+async fn execute_swap_transfer(
+    state: &Arc<RelayState>,
+    request_id: &str,
+    request: &kausalayer::relay::DepositRequest,
+    deposit_keypair: &solana_sdk::signature::Keypair,
+    hop1_keypair: &solana_sdk::signature::Keypair,
+    hop2_keypair: &solana_sdk::signature::Keypair,
+) -> Result<Json<TransferResult>, (StatusCode, String)> {
+    // Parse swap data from recipient_meta: "swap:{token_mint}:{destination}"
+    let parts: Vec<&str> = request.recipient_meta.split(':').collect();
+    if parts.len() != 3 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid swap format".to_string()));
+    }
+    let token_mint = parts[1];
+    let destination = parts[2];
+    
+    info!("Executing SWAP: {} lamports -> {} to {}", request.amount_lamports, token_mint, destination);
+    
+    // Calculate amounts for hops (same as regular transfer)
+    let amount_for_hop1 = request.amount_lamports + request.fee_lamports + TX_FEE_LAMPORTS * 2;
+    let amount_for_hop2 = request.amount_lamports + request.fee_lamports + TX_FEE_LAMPORTS;
+    
+    // ========== TX 1: Deposit -> Hop1 ==========
+    let blockhash = state.client.get_latest_blockhash()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Blockhash error: {}", e)))?;
+    
+    let tx1 = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&deposit_keypair.pubkey(), &hop1_keypair.pubkey(), amount_for_hop1)],
+        Some(&deposit_keypair.pubkey()),
+        &[deposit_keypair],
+        blockhash,
+    );
+    
+    let sig1 = state.client.send_and_confirm_transaction(&tx1)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("TX 1 failed: {}", e)))?;
+    info!("Swap TX 1 success: {}", sig1);
+    
+    // ========== TX 2: Hop1 -> Hop2 ==========
+    let blockhash = state.client.get_latest_blockhash()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Blockhash error: {}", e)))?;
+    
+    let tx2 = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&hop1_keypair.pubkey(), &hop2_keypair.pubkey(), amount_for_hop2)],
+        Some(&hop1_keypair.pubkey()),
+        &[hop1_keypair],
+        blockhash,
+    );
+    
+    let sig2 = state.client.send_and_confirm_transaction(&tx2)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("TX 2 failed: {}", e)))?;
+    info!("Swap TX 2 success: {}", sig2);
+    
+    
+    // ========== Execute Jupiter Swap from Hop2 ==========
+    // Get actual balance in hop2 after fee transfer
+    let hop2_balance = state.client.get_balance(&hop2_keypair.pubkey())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Balance check failed: {}", e)))?;
+    // Reserve fee (0.5%) + 0.003 SOL for gas fees
+    let swap_amount = hop2_balance.saturating_sub(request.fee_lamports + 10_000_000); // Reserve 10k lamports for tx fee
+    let destination_pubkey = Pubkey::from_str(destination)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid destination: {}", e)))?;
+    match execute_jupiter_swap(state, hop2_keypair, swap_amount, token_mint, &destination_pubkey).await {
+        Ok(swap_sig) => {
+            info!("Jupiter swap success: {}", swap_sig);
+
+            // TX 5: Transfer protocol fee to fee wallet
+            let blockhash = state.client.get_latest_blockhash()
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Blockhash error: {}", e)))?;
+            let fee_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &state.fee_wallet, request.fee_lamports);
+            let tx5 = Transaction::new_signed_with_payer(
+                &[fee_ix],
+                Some(&hop2_keypair.pubkey()),
+                &[hop2_keypair],
+                blockhash,
+            );
+            state.client.send_and_confirm_transaction(&tx5)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Fee transfer failed: {}", e)))?;
+            info!("TX 5 success: fee sent to fee wallet");
+
+            // TX 6: Transfer remaining SOL to destination
+            let remaining_sol = state.client.get_balance(&hop2_keypair.pubkey()).unwrap_or(0);
+            if remaining_sol > 5000 {
+                let blockhash = state.client.get_latest_blockhash().unwrap();
+                let sol_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &destination_pubkey, remaining_sol - 5000);
+                let tx6 = Transaction::new_signed_with_payer(
+                    &[sol_ix],
+                    Some(&hop2_keypair.pubkey()),
+                    &[hop2_keypair],
+                    blockhash,
+                );
+                if let Ok(_) = state.client.send_and_confirm_transaction(&tx6) {
+                    info!("TX 6 success: remaining {} SOL sent to destination", lamports_to_sol(remaining_sol - 5000));
+                }
+            }
+            state.db.mark_completed(request_id, &swap_sig.to_string()).ok();
+
+            Ok(Json(TransferResult {
+                status: "success".to_string(),
+                signature: Some(swap_sig.to_string()),
+                message: format!("Swapped {} SOL to tokens - sent to {}",
+                    lamports_to_sol(swap_amount), destination),
+            }))
+        }
+        Err(e) => {
+            // Mark as swap_failed so user can retry or recover
+            state.db.mark_swap_failed(request_id).ok();
+            error!("Jupiter swap failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Swap failed: {}", e)))
+        }
+    }
+}
+
+// ============ RETRY SWAP ============
+async fn retry_swap(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<RetrySwapRequest>,
+) -> Result<Json<TransferResult>, (StatusCode, String)> {
+    info!("Retry swap request: {}", req.request_id);
+
+    // Get request from DB
+    let request = state.db.get_request(&req.request_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?
+        .ok_or((StatusCode::NOT_FOUND, "Request not found".to_string()))?;
+
+    // Check status is swap_failed
+    if request.status != kausalayer::relay::RequestStatus::SwapFailed {
+        return Err((StatusCode::BAD_REQUEST, 
+            format!("Request status is '{}', must be 'swap_failed' to retry", request.status.as_str())));
+    }
+
+    // Parse swap data from recipient_meta: "swap:{token_mint}:{destination}"
+    let parts: Vec<&str> = request.recipient_meta.split(':').collect();
+    if parts.len() != 3 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid swap format in request".to_string()));
+    }
+    let token_mint = parts[1];
+    let destination = parts[2];
+
+    // Get hop2 keypair
+    let hop2_keypair = state.db.get_hop_keypair(&req.request_id, 2)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Keypair error: {}", e)))?;
+
+    // Check hop2 balance
+    let hop2_balance = state.client.get_balance(&hop2_keypair.pubkey())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Balance check failed: {}", e)))?;
+
+    if hop2_balance < 10_000_000 {
+        return Err((StatusCode::BAD_REQUEST, 
+            format!("Insufficient balance in hop2: {} lamports", hop2_balance)));
+    }
+
+    // Calculate swap amount (reserve for fees)
+    let swap_amount = hop2_balance.saturating_sub(request.fee_lamports + 10_000_000);
+    let destination_pubkey = Pubkey::from_str(destination)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid destination: {}", e)))?;
+
+    info!("Retrying swap: {} lamports -> {} to {}", swap_amount, token_mint, destination);
+
+    // Execute Jupiter swap
+    match execute_jupiter_swap(&state, &hop2_keypair, swap_amount, token_mint, &destination_pubkey).await {
+        Ok(swap_sig) => {
+            info!("Retry swap success: {}", swap_sig);
+
+            // Transfer fee to fee wallet
+            let blockhash = state.client.get_latest_blockhash()
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Blockhash error: {}", e)))?;
+            let fee_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &state.fee_wallet, request.fee_lamports);
+            let fee_tx = Transaction::new_signed_with_payer(
+                &[fee_ix],
+                Some(&hop2_keypair.pubkey()),
+                &[&hop2_keypair],
+                blockhash,
+            );
+            state.client.send_and_confirm_transaction(&fee_tx).ok();
+
+            // Transfer remaining SOL to destination
+            let remaining_sol = state.client.get_balance(&hop2_keypair.pubkey()).unwrap_or(0);
+            if remaining_sol > 5000 {
+                let blockhash = state.client.get_latest_blockhash().unwrap();
+                let sol_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &destination_pubkey, remaining_sol - 5000);
+                let sol_tx = Transaction::new_signed_with_payer(
+                    &[sol_ix],
+                    Some(&hop2_keypair.pubkey()),
+                    &[&hop2_keypair],
+                    blockhash,
+                );
+                state.client.send_and_confirm_transaction(&sol_tx).ok();
+            }
+
+            // Mark as completed
+            state.db.mark_completed(&req.request_id, &swap_sig).ok();
+
+            Ok(Json(TransferResult {
+                status: "success".to_string(),
+                signature: Some(swap_sig.clone()),
+                message: format!("Retry swap successful: {}", swap_sig),
+            }))
+        }
+        Err(e) => {
+            error!("Retry swap failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Retry swap failed: {}", e)))
+        }
+    }
+}
+
+// ============ RECOVER FUNDS ============
+async fn recover_funds(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<RecoverRequest>,
+) -> Result<Json<TransferResult>, (StatusCode, String)> {
+    info!("Recover funds request: {}", req.request_id);
+
+
+    // Get request from DB
+    let request = state.db.get_request(&req.request_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?
+        .ok_or((StatusCode::NOT_FOUND, "Request not found".to_string()))?;
+
+    // Check status is swap_failed
+    if request.status != kausalayer::relay::RequestStatus::SwapFailed {
+        return Err((StatusCode::BAD_REQUEST, 
+            format!("Request status is '{}', must be 'swap_failed' to recover", request.status.as_str())));
+    }
+
+    // Parse destination from recipient_meta: "swap:{token_mint}:{destination}"
+    let parts: Vec<&str> = request.recipient_meta.split(':').collect();
+    if parts.len() != 3 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid swap format in request".to_string()));
+    }
+    let destination = parts[2];
+    let recover_pubkey = Pubkey::from_str(destination)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid destination: {}", e)))?;
+
+    // Get hop2 keypair
+    let hop2_keypair = state.db.get_hop_keypair(&req.request_id, 2)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Keypair error: {}", e)))?;
+
+    // Check hop2 balance
+    let hop2_balance = state.client.get_balance(&hop2_keypair.pubkey())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Balance check failed: {}", e)))?;
+
+    if hop2_balance < 10_000 {
+        return Err((StatusCode::BAD_REQUEST, 
+            format!("No funds to recover in hop2: {} lamports", hop2_balance)));
+    }
+
+    info!("Recovering {} lamports from hop2 to {}", hop2_balance, destination);
+
+    // Transfer all SOL to recover wallet (minus tx fee)
+    let transfer_amount = hop2_balance.saturating_sub(5000);
+    let blockhash = state.client.get_latest_blockhash()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Blockhash error: {}", e)))?;
+
+    let transfer_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &recover_pubkey, transfer_amount);
+    let tx = Transaction::new_signed_with_payer(
+        &[transfer_ix],
+        Some(&hop2_keypair.pubkey()),
+        &[&hop2_keypair],
+        blockhash,
+    );
+
+    let sig = state.client.send_and_confirm_transaction(&tx)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Transfer failed: {}", e)))?;
+
+    info!("Recovery successful: {} - {} SOL sent to {}", sig, lamports_to_sol(transfer_amount), destination);
+
+    // Mark as completed (recovered)
+    state.db.mark_completed(&req.request_id, &sig.to_string()).ok();
+
+    Ok(Json(TransferResult {
+        status: "success".to_string(),
+        signature: Some(sig.to_string()),
+        message: format!("Recovered {} SOL to {}", lamports_to_sol(transfer_amount), destination),
+    }))
+}
+
+// ============ GET FAILED SWAPS ============
+async fn get_failed_swaps(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<FailedSwapsRequest>,
+) -> Result<Json<FailedSwapsResponse>, (StatusCode, String)> {
+    info!("Get failed swaps request for owner: {}...", &req.owner_identifier[..16.min(req.owner_identifier.len())]);
+
+    let requests = state.db.get_failed_swaps_by_owner(&req.owner_identifier)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+
+    let swaps: Vec<FailedSwapInfo> = requests
+        .into_iter()
+        .filter_map(|r| {
+            // Parse destination from recipient_meta: "swap:{token_mint}:{destination}"
+            let parts: Vec<&str> = r.recipient_meta.split(':').collect();
+            if parts.len() == 3 {
+                Some(FailedSwapInfo {
+                    request_id: r.request_id,
+                    amount_lamports: r.amount_lamports,
+                    destination: parts[2].to_string(),
+                    created_at: r.created_at,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    info!("Found {} failed swaps", swaps.len());
+    Ok(Json(FailedSwapsResponse { swaps }))
+}
 async fn cleanup_expired(State(state): State<Arc<RelayState>>) -> Json<serde_json::Value> {
     let expired = state.db.get_expired_requests().unwrap_or_default();
     let mut cleaned = 0;
@@ -430,7 +1134,7 @@ async fn scan_transfers(
     let recipient_meta = format!("kl_{}", bs58::encode(&combined).into_string());
 
     // Query database
-    let db_transfers = state.db.get_transfers_for_recipient(&recipient_meta)
+    let db_transfers = state.db.get_transfers_for_recipient(&recipient_meta, None)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
 
     // Convert to response format
@@ -614,6 +1318,7 @@ async fn token_request_transfer(
         req.amount,
         breakdown.kausa_fee,
         &req.recipient_meta,
+        None, // owner_identifier
         &deposit_address.to_string(),
         &deposit_ata.to_string(),
         &deposit_keypair.to_bytes(),
@@ -755,7 +1460,7 @@ async fn token_scan_transfers(
     let recipient_meta = format!("kl_{}", bs58::encode(&combined).into_string());
 
     // Query database
-    let db_transfers = state.db.get_token_transfers_for_recipient(&recipient_meta)
+    let db_transfers = state.db.get_token_transfers_for_recipient(&recipient_meta, None)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
 
     // Convert to response format
@@ -913,6 +1618,7 @@ async fn token_execute_transfer(
             // Save to token_transfers for scan
             state.db.save_token_transfer(
                 &request.recipient_meta,
+                None, // owner_identifier
                 &stealth_pubkey.to_string(),
                 &stealth_ata.to_string(),
                 &ephemeral_str,
@@ -986,6 +1692,701 @@ async fn token_info(
         symbol: "tokens".to_string(), // Could fetch from metadata later
     }))
 }
+
+// ============ SUBSCRIPTION HANDLERS ============
+
+#[derive(Deserialize)]
+struct SubscribeRequest {
+    meta_address: String,
+    payment_tx_hash: String,
+    payment_type: String,  // "USDC" or "KAUSA"
+}
+
+#[derive(Serialize)]
+struct SubscribeResponse {
+    success: bool,
+    message: String,
+    expires_at: Option<i64>,
+}
+
+async fn subscribe_verify(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<SubscribeRequest>,
+) -> Result<Json<SubscribeResponse>, (StatusCode, String)> {
+    use solana_sdk::signature::Signature;
+    use solana_transaction_status::UiTransactionEncoding;
+    use std::str::FromStr;
+
+    // Validate payment type
+    if req.payment_type != "USDC" && req.payment_type != "KAUSA" {
+        return Err((StatusCode::BAD_REQUEST, "Invalid payment type. Use USDC or KAUSA".to_string()));
+    }
+
+    // Check if tx already used
+    if state.db.is_payment_tx_used(&req.payment_tx_hash).unwrap_or(false) {
+        return Err((StatusCode::BAD_REQUEST, "Payment transaction already used".to_string()));
+    }
+
+    // Parse signature
+    let signature = Signature::from_str(&req.payment_tx_hash)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid transaction signature".to_string()))?;
+
+    // Fetch transaction from chain
+    let tx = state.client
+        .get_transaction(&signature, UiTransactionEncoding::Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Transaction not found or not confirmed: {}", e)))?;
+
+    // Check if transaction was successful
+    if let Some(meta) = &tx.transaction.meta {
+        if meta.err.is_some() {
+            return Err((StatusCode::BAD_REQUEST, "Transaction failed on-chain".to_string()));
+        }
+    }
+
+    // Determine required amount based on payment type
+    let (required_mint, required_amount): (&str, u64) = if req.payment_type == "USDC" {
+        (USDC_MINT, SUBSCRIPTION_USDC_AMOUNT)
+    } else {
+        // KAUSA - get required amount from price cache
+        let cache = state.get_kausa_price();
+        if cache.kausa_required == 0 {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "KAUSA price not available. Try again later.".to_string()));
+        }
+        (KAUSA_MINT, cache.kausa_required)
+    };
+
+    // Parse transaction to verify token transfer
+    // For SPL Token transfers, we need to check the inner instructions
+    // The transaction should contain a transfer to fee_wallet's ATA
+    
+    let fee_wallet_str = FEE_WALLET;
+    let mut verified_amount: u64 = 0;
+    let mut payment_verified = false;
+
+    // Get transaction message for account keys
+    // Check pre/post token balances for the transfer
+    if let Some(meta) = &tx.transaction.meta {
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        
+        let pre_balances: Vec<_> = match &meta.pre_token_balances {
+            OptionSerializer::Some(b) => b.clone(),
+            _ => vec![],
+        };
+        let post_balances: Vec<_> = match &meta.post_token_balances {
+            OptionSerializer::Some(b) => b.clone(),
+            _ => vec![],
+        };
+
+        // Find fee_wallet's token account balance change
+        for post in post_balances.iter() {
+            let owner_str: String = match &post.owner {
+                OptionSerializer::Some(o) => o.clone(),
+                _ => continue,
+            };
+            
+            // Check if owner is our fee_wallet and mint matches
+            if owner_str == fee_wallet_str && post.mint == required_mint {
+                let post_amount = post.ui_token_amount.amount.parse::<u64>().unwrap_or(0);
+                
+                // Find corresponding pre-balance
+                let pre_amount = pre_balances.iter()
+                    .find(|pre| {
+                        let pre_owner: String = match &pre.owner {
+                            OptionSerializer::Some(o) => o.clone(),
+                            _ => return false,
+                        };
+                        pre_owner == fee_wallet_str && pre.mint == required_mint
+                    })
+                    .map(|pre| pre.ui_token_amount.amount.parse::<u64>().unwrap_or(0))
+                    .unwrap_or(0);
+
+                verified_amount = post_amount.saturating_sub(pre_amount);
+                
+                if verified_amount >= required_amount {
+                    payment_verified = true;
+                }
+                break;
+            }
+        }
+    }
+
+    if !payment_verified {
+        return Err((StatusCode::BAD_REQUEST, format!(
+            "Payment verification failed. Required: {} tokens to fee wallet {}. Found: {} tokens.",
+            required_amount as f64 / 1_000_000.0,
+            fee_wallet_str,
+            verified_amount as f64 / 1_000_000.0
+        )));
+    }
+
+    // Create subscription (30 days)
+    match state.db.create_subscription(
+        &req.meta_address,
+        &req.payment_tx_hash,
+        &req.payment_type,
+        verified_amount,
+        30, // 30 days
+    ) {
+        Ok(sub) => {
+            info!("Subscription created: {} paid {} {} (tx: {})", 
+                &req.meta_address[..20], 
+                verified_amount as f64 / 1_000_000.0,
+                req.payment_type,
+                &req.payment_tx_hash[..16]);
+            Ok(Json(SubscribeResponse {
+                success: true,
+                message: format!("Subscription activated! {} {} received.", 
+                    verified_amount as f64 / 1_000_000.0, 
+                    req.payment_type),
+                expires_at: Some(sub.expires_at),
+            }))
+        },
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create subscription: {}", e))),
+    }
+}
+
+#[derive(Deserialize)]
+struct CheckSubscriptionRequest {
+    meta_address: String,
+}
+
+#[derive(Serialize)]
+struct CheckSubscriptionResponse {
+    is_subscribed: bool,
+    expires_at: Option<i64>,
+    payment_type: Option<String>,
+}
+
+async fn check_subscription(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<CheckSubscriptionRequest>,
+) -> Json<CheckSubscriptionResponse> {
+    match state.db.get_subscription(&req.meta_address) {
+        Ok(Some(sub)) => Json(CheckSubscriptionResponse {
+            is_subscribed: true,
+            expires_at: Some(sub.expires_at),
+            payment_type: Some(sub.payment_type),
+        }),
+        _ => Json(CheckSubscriptionResponse {
+            is_subscribed: false,
+            expires_at: None,
+            payment_type: None,
+        }),
+    }
+}
+
+// ============ ALIAS HANDLERS ============
+
+#[derive(Deserialize)]
+struct RegisterAliasRequest {
+    alias: String,
+    meta_address: String,
+    owner_meta_address: String,
+}
+
+#[derive(Serialize)]
+struct AliasResponse {
+    success: bool,
+    alias: Option<String>,
+    message: String,
+}
+
+async fn register_alias(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<RegisterAliasRequest>,
+) -> Result<Json<AliasResponse>, (StatusCode, String)> {
+    // Check if owner is subscribed
+    if !state.db.is_subscribed(&req.owner_meta_address).unwrap_or(false) {
+        return Err((StatusCode::FORBIDDEN, "Active subscription required to register alias".to_string()));
+    }
+
+    // Check alias availability
+    if !state.db.is_alias_available(&req.alias).unwrap_or(false) {
+        return Err((StatusCode::CONFLICT, "Alias already taken".to_string()));
+    }
+
+    // Create alias
+    match state.db.create_alias(&req.alias, &req.meta_address, &req.owner_meta_address) {
+        Ok(alias) => Ok(Json(AliasResponse {
+            success: true,
+            alias: Some(alias.alias),
+            message: "Alias registered successfully".to_string(),
+        })),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct ResolveAliasQuery {
+    alias: String,
+}
+
+#[derive(Serialize)]
+struct ResolveAliasResponse {
+    found: bool,
+    alias: String,
+    meta_address: Option<String>,
+}
+
+async fn resolve_alias(
+    State(state): State<Arc<RelayState>>,
+    Query(query): Query<ResolveAliasQuery>,
+) -> Json<ResolveAliasResponse> {
+    match state.db.resolve_alias(&query.alias) {
+        Ok(Some(meta)) => Json(ResolveAliasResponse {
+            found: true,
+            alias: query.alias,
+            meta_address: Some(meta),
+        }),
+        _ => Json(ResolveAliasResponse {
+            found: false,
+            alias: query.alias,
+            meta_address: None,
+        }),
+    }
+}
+
+#[derive(Serialize)]
+struct CheckAliasResponse {
+    alias: String,
+    available: bool,
+}
+
+async fn check_alias_available(
+    State(state): State<Arc<RelayState>>,
+    Query(query): Query<ResolveAliasQuery>,
+) -> Json<CheckAliasResponse> {
+    let available = state.db.is_alias_available(&query.alias).unwrap_or(true);
+    Json(CheckAliasResponse {
+        alias: query.alias,
+        available,
+    })
+}
+
+#[derive(Deserialize)]
+struct ListAliasesQuery {
+    meta_address: String,
+}
+
+#[derive(Serialize)]
+struct AliasInfo {
+    alias: String,
+    created_at: i64,
+}
+
+#[derive(Serialize)]
+struct ListAliasesResponse {
+    aliases: Vec<AliasInfo>,
+}
+
+async fn list_aliases(
+    State(state): State<Arc<RelayState>>,
+    Query(query): Query<ListAliasesQuery>,
+) -> Json<ListAliasesResponse> {
+    let aliases = state.db.list_aliases(&query.meta_address).unwrap_or_default();
+    Json(ListAliasesResponse {
+        aliases: aliases.into_iter().map(|(alias, created_at)| AliasInfo {
+            alias,
+            created_at,
+        }).collect(),
+    })
+}
+
+// ============ API KEY HANDLERS ============
+
+#[derive(Deserialize)]
+struct GenerateApiKeyRequest {
+    meta_address: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ApiKeyResponse {
+    success: bool,
+    api_key: Option<String>,
+    key_prefix: Option<String>,
+    message: String,
+}
+
+async fn generate_api_key(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<GenerateApiKeyRequest>,
+) -> Result<Json<ApiKeyResponse>, (StatusCode, String)> {
+    // Check if user is subscribed
+    if !state.db.is_subscribed(&req.meta_address).unwrap_or(false) {
+        return Err((StatusCode::FORBIDDEN, "Active subscription required to generate API key".to_string()));
+    }
+
+    // Generate API key
+    match state.db.create_api_key(&req.meta_address, &req.name) {
+        Ok((full_key, record)) => Ok(Json(ApiKeyResponse {
+            success: true,
+            api_key: Some(full_key),
+            key_prefix: Some(record.key_prefix),
+            message: "API key generated. Save it now - it won't be shown again!".to_string(),
+        })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to generate API key: {}", e))),
+    }
+}
+
+#[derive(Deserialize)]
+struct RevokeApiKeyRequest {
+    api_key: String,
+}
+
+async fn revoke_api_key(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<RevokeApiKeyRequest>,
+) -> Json<serde_json::Value> {
+    let revoked = state.db.revoke_api_key(&req.api_key).unwrap_or(false);
+    Json(serde_json::json!({
+        "success": revoked,
+        "message": if revoked { "API key revoked" } else { "API key not found" }
+    }))
+}
+
+// ============ DESTINATION WALLETS ============
+
+#[derive(Debug, Deserialize)]
+struct AddDestinationRequest {
+    meta_address: String,
+    slot: u8,
+    wallet_address: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteDestinationRequest {
+    meta_address: String,
+    slot: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListDestinationRequest {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DestinationWallet {
+    slot: u8,
+    wallet_address: String,
+}
+
+async fn add_destination_wallet(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<AddDestinationRequest>,
+) -> Json<serde_json::Value> {
+    // Hash meta address for privacy
+    let mut hasher = Sha256::new();
+    hasher.update(req.meta_address.as_bytes());
+    let owner_hash = format!("{:x}", hasher.finalize());
+    match state.db.add_destination_wallet(&owner_hash, req.slot, &req.wallet_address) {
+        Ok(()) => Json(serde_json::json!({
+            "success": true,
+            "message": format!("Wallet {} saved to slot {}", req.wallet_address, req.slot)
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))
+    }
+}
+
+async fn delete_destination_wallet(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<DeleteDestinationRequest>,
+) -> Json<serde_json::Value> {
+    let mut hasher = Sha256::new();
+    hasher.update(req.meta_address.as_bytes());
+    let owner_hash = format!("{:x}", hasher.finalize());
+    match state.db.delete_destination_wallet(&owner_hash, req.slot) {
+        Ok(deleted) => Json(serde_json::json!({
+            "success": deleted,
+            "message": if deleted { format!("Wallet slot {} removed", req.slot) } else { "Slot not found".to_string() }
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))
+    }
+}
+
+async fn list_destination_wallets(
+    State(state): State<Arc<RelayState>>,
+    Query(req): Query<ListDestinationRequest>,
+) -> Json<serde_json::Value> {
+    let mut hasher = Sha256::new();
+    hasher.update(req.meta_address.as_bytes());
+    let owner_hash = format!("{:x}", hasher.finalize());
+    match state.db.list_destination_wallets(&owner_hash) {
+        Ok(wallets) => {
+            let list: Vec<DestinationWallet> = wallets.into_iter()
+                .map(|(slot, addr)| DestinationWallet { slot, wallet_address: addr })
+                .collect();
+            Json(serde_json::json!({
+                "success": true,
+                "wallets": list
+            }))
+        },
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))
+    }
+}
+
+
+// ============ JUPITER SWAP ============
+
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+#[derive(Debug, Deserialize)]
+struct SwapRequest {
+    #[serde(default)]
+    user_wallet: String,
+    amount: f64,
+    token_mint: String,
+    destination: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SwapRequestResponse {
+    success: bool,
+    request_id: Option<String>,
+    transaction: Option<String>,
+    intermediate_address: Option<String>,
+    estimated_output: Option<String>,
+    fee: Option<f64>,
+    deposit_amount: Option<f64>,
+    expires_in: Option<i64>,
+    message: Option<String>,
+}
+
+async fn request_swap(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<SwapRequest>,
+) -> Json<SwapRequestResponse> {
+    if req.amount < 0.01 {
+        return Json(SwapRequestResponse {
+            success: false, request_id: None, transaction: None,
+            intermediate_address: None, estimated_output: None, fee: None, deposit_amount: None,
+            expires_in: None, message: Some("Minimum swap is 0.01 SOL".into()),
+        });
+    }
+    
+    // Get Jupiter quote
+    let amount_lamports = sol_to_lamports(req.amount);
+    let quote = match get_jupiter_quote(amount_lamports, &req.token_mint).await {
+        Ok(q) => q,
+        Err(e) => return Json(SwapRequestResponse {
+            success: false, request_id: None, transaction: None,
+            intermediate_address: None, estimated_output: None, fee: None, deposit_amount: None,
+            expires_in: None, message: Some(format!("Quote failed: {}", e)),
+        }),
+    };
+    
+    let fee_lamports = ((amount_lamports as f64) * FEE_PERCENT / 100.0) as u64;
+    let total_deposit = amount_lamports + fee_lamports + TX_FEE_TOTAL;
+    let request_id = format!("swap_{}", chrono::Utc::now().timestamp_millis());
+    
+    // Hash destination as owner_identifier for ownership validation
+    let mut hasher = Sha256::new();
+    hasher.update(req.destination.as_bytes());
+    let owner_hash = format!("{:x}", hasher.finalize());
+    
+    let (request, _) = match state.db.create_request(
+        &request_id, amount_lamports, fee_lamports,
+        &format!("swap:{}:{}", req.token_mint, req.destination),
+        Some(&owner_hash),
+        EXPIRY_SECONDS,
+    ) {
+        Ok(r) => r,
+        Err(e) => return Json(SwapRequestResponse {
+            success: false, request_id: None, transaction: None,
+            intermediate_address: None, estimated_output: None, fee: None, deposit_amount: None,
+            expires_in: None, message: Some(format!("DB error: {}", e)),
+        }),
+    };
+
+    // Generate 2 intermediate stealth keypairs for 3-hop privacy (same as regular transfer)
+    let hop1_keypair = solana_sdk::signature::Keypair::new();
+    let hop2_keypair = solana_sdk::signature::Keypair::new();
+    if let Err(e) = state.db.create_intermediate_hops(
+        &request_id,
+        &hop1_keypair.pubkey().to_string(),
+        &hop1_keypair.to_bytes(),
+        &hop2_keypair.pubkey().to_string(),
+        &hop2_keypair.to_bytes(),
+    ) {
+        return Json(SwapRequestResponse {
+            success: false, request_id: None, transaction: None,
+            intermediate_address: None, estimated_output: None, fee: None, deposit_amount: None,
+            expires_in: None, message: Some(format!("Failed to create hops: {}", e)),
+        });
+    }
+    
+    info!("Swap request {}: {} SOL -> {} to {}", request_id, req.amount, req.token_mint, req.destination);
+    
+    Json(SwapRequestResponse {
+        success: true,
+        request_id: Some(request_id),
+        transaction: None, // TODO: build unsigned tx
+        intermediate_address: Some(request.deposit_address),
+        estimated_output: Some(quote.out_amount),
+        fee: Some(lamports_to_sol(fee_lamports)),
+        deposit_amount: Some(lamports_to_sol(total_deposit)),
+        expires_in: Some(EXPIRY_SECONDS),
+        message: None,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct JupiterQuoteResponse {
+    #[serde(rename = "outAmount")]
+    out_amount: String,
+}
+
+async fn get_jupiter_quote(amount_lamports: u64, output_mint: &str) -> Result<JupiterQuoteResponse, String> {
+    let url = format!(
+        "https://api.jup.ag/swap/v1/quote?inputMint={}&outputMint={}&amount={}&slippageBps=100",
+        SOL_MINT, output_mint, amount_lamports
+    );
+    
+    let client = reqwest::Client::new();
+    let resp = client.get(&url)
+        .header("x-api-key", std::env::var("JUPITER_API_KEY").unwrap_or_default())
+        .send().await.map_err(|e| e.to_string())?;
+    
+    if !resp.status().is_success() {
+        return Err(format!("Jupiter error: {}", resp.status()));
+    }
+    
+    resp.json().await.map_err(|e| e.to_string())
+}
+
+// Execute Jupiter swap via Node.js script
+async fn execute_jupiter_swap(
+    _state: &Arc<RelayState>,
+    signer_keypair: &solana_sdk::signature::Keypair,
+    amount_lamports: u64,
+    output_mint: &str,
+    destination: &Pubkey,
+) -> Result<String, String> {
+    use std::process::Command;
+    
+    // Convert keypair to base58
+    let privkey_bs58 = bs58::encode(signer_keypair.to_bytes()).into_string();
+    
+    info!("Calling Jupiter swap script: {} lamports -> {} to {}", 
+        amount_lamports, output_mint, destination);
+    
+    let output = Command::new("node")
+        .arg("/root/kausalayer/scripts/swap.js")
+        .arg(&privkey_bs58)
+        .arg(amount_lamports.to_string())
+        .arg(output_mint)
+        .arg(destination.to_string())
+        .output()
+        .map_err(|e| format!("Failed to run swap script: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Swap script failed: {}", stderr));
+    }
+    
+    let signature = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    info!("Jupiter swap success: {}", signature);
+    
+    Ok(signature)
+}
+
+// Helper: get ATA address as string
+fn get_ata_address_string(wallet: &Pubkey, mint_str: &str) -> String {
+    let mint = Pubkey::from_str(mint_str).unwrap_or_default();
+    let (ata, _) = Pubkey::find_program_address(
+        &[
+            wallet.as_ref(),
+            spl_token::id().as_ref(),
+            mint.as_ref(),
+        ],
+        &spl_associated_token_account::id(),
+    );
+    ata.to_string()
+}
+// ============ PRICE FETCH ============
+
+/// Fetch KAUSA price from DexScreener
+async fn fetch_kausa_price() -> Result<f64, String> {
+    let url = format!(
+        "https://api.dexscreener.com/latest/dex/tokens/{}",
+        KAUSA_MINT
+    );
+    
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error: {}", e))?;
+    
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse error: {}", e))?;
+    
+    // DexScreener returns { pairs: [{ priceUsd: "0.001234" }, ...] }
+    let price_str = json["pairs"]
+        .get(0)
+        .and_then(|p| p["priceUsd"].as_str())
+        .ok_or("No price found")?;
+    
+    price_str.parse::<f64>().map_err(|e| format!("Price parse error: {}", e))
+}
+
+/// Background task to update KAUSA price every 5 minutes
+async fn price_update_task(state: Arc<RelayState>) {
+    loop {
+        match fetch_kausa_price().await {
+            Ok(price) => {
+                state.update_kausa_price(price);
+                let cache = state.get_kausa_price();
+                info!("Price updated: KAUSA = ${:.6}, Required for sub: {} KAUSA", 
+                    cache.kausa_price_usd, 
+                    cache.kausa_required as f64 / 1_000_000.0);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch KAUSA price: {}", e);
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(PRICE_CACHE_SECONDS)).await;
+    }
+}
+
+// GET /subscribe/price - Get current subscription prices
+#[derive(Serialize)]
+struct SubscriptionPriceResponse {
+    usdc_amount: f64,           // 20.0
+    kausa_price_usd: f64,       // Current price
+    kausa_amount: f64,          // Required KAUSA tokens
+    kausa_value_usd: f64,       // 15.0
+    last_updated: i64,
+    cache_seconds: u64,
+}
+
+async fn get_subscription_price(
+    State(state): State<Arc<RelayState>>,
+) -> Json<SubscriptionPriceResponse> {
+    let cache = state.get_kausa_price();
+    Json(SubscriptionPriceResponse {
+        usdc_amount: 20.0,
+        kausa_price_usd: cache.kausa_price_usd,
+        kausa_amount: cache.kausa_required as f64 / 1_000_000.0,
+        kausa_value_usd: SUBSCRIPTION_KAUSA_USD,
+        last_updated: cache.last_updated,
+        cache_seconds: PRICE_CACHE_SECONDS,
+    })
+}
+
 // ============ MAIN ============
 
 #[tokio::main]
@@ -1016,25 +2417,62 @@ async fn main() {
     println!("   Min amount: {} SOL", MIN_AMOUNT_SOL);
     println!("   Expiry: {} minutes", EXPIRY_SECONDS / 60);
 
-    let app = Router::new()
+    // Public routes (no API key required)
+    let public_routes = Router::new()
         .route("/health", get(health))
         .route("/info", get(info_handler))
+        .route("/subscribe/price", get(get_subscription_price))
+        .with_state(state.clone());
+
+    // Spawn background task for price updates
+    let price_state = state.clone();
+    tokio::spawn(async move {
+        price_update_task(price_state).await;
+    });
+
+    // Protected routes (API key required)
+    let protected_routes = Router::new()
+        .route("/stats", get(get_stats))
         .route("/balance", post(get_balance))
         .route("/transfer/request", post(request_transfer))
         .route("/transfer/status", post(check_status))
         .route("/transfer/execute", post(execute_transfer))
+        .route("/transfer/retry", post(retry_swap))
+        .route("/transfer/recover", post(recover_funds))
+        .route("/transfer/failed", post(get_failed_swaps))
         .route("/scan", post(scan_transfers))
         .route("/cleanup", post(cleanup_expired))
         .route("/blockhash", get(get_blockhash))
         .route("/submit", post(submit_transaction))
         .route("/claim/complete", post(claim_complete))
-            .route("/token/info", get(token_info))
+        .route("/token/info", get(token_info))
         .route("/token/request", post(token_request_transfer))
         .route("/token/prepare", post(token_prepare_ata))
         .route("/token/scan", post(token_scan_transfers))
         .route("/token/execute", post(token_execute_transfer))
         .route("/token/claim/complete", post(token_claim_complete))
+        // Subscription routes
+        .route("/subscribe/verify", post(subscribe_verify))
+        .route("/subscribe/check", post(check_subscription))
+        // Alias routes
+        .route("/alias/register", post(register_alias))
+        .route("/alias/resolve", get(resolve_alias))
+        .route("/alias/check", get(check_alias_available))
+        .route("/alias/list", get(list_aliases))
+        // API Key routes
+        .route("/api-key/generate", post(generate_api_key))
+        .route("/api-key/revoke", post(revoke_api_key))
+        // Destination wallet routes
+        .route("/wallet/destination/add", post(add_destination_wallet))
+        .route("/wallet/destination/delete", post(delete_destination_wallet))
+        .route("/wallet/destination/list", get(list_destination_wallets))
+        .route("/swap/request", post(request_swap))
+        .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .with_state(state.clone());
+
+    let app = Router::new()
+        .merge(public_routes)
+        .merge(protected_routes);
 
     // Background cleanup task - every 5 minutes
     let cleanup_state = state.clone();
@@ -1050,14 +2488,16 @@ async fn main() {
                 cleaned += 1;
             }
             let deleted = cleanup_state.db.cleanup_old_requests().unwrap_or(0);
-            if cleaned > 0 || deleted > 0 {
-                info!("Cleanup done: {} marked expired, {} old records deleted", cleaned, deleted);
+            let hops_deleted = cleanup_state.db.cleanup_old_hops().unwrap_or(0);
+            if cleaned > 0 || deleted > 0 || hops_deleted > 0 {
+                info!("Cleanup done: {} marked expired, {} old records deleted, {} old hops deleted", cleaned, deleted, hops_deleted);
             }
         }
     });
 
     println!("\n🌐 Relay server started on port {}", port);
-    println!("🧅 Tor hidden service active\n");
+    println!("🧅 Tor hidden service active");
+    println!("🔐 API Key: {}\n", if state.api_key.is_some() { "ENABLED" } else { "DISABLED (public access)" });
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
     axum::serve(listener, app).await.unwrap();

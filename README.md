@@ -1,11 +1,11 @@
 <div align="center">
   <img src="kausalayer-logo.png" alt="KausaLayer" width="120" />
-  
+
   # KausaLayer
 
   **Private transfers on Solana using stealth addresses**
 
-  [Website](https://kausalayer.com) · [Documentation](https://docs.kausalayer.com)
+  [Website](https://kausalayer.com) · [Documentation](https://docs.kausalayer.com) · [X (Twitter)](https://x.com/kausalayer)
 
 </div>
 
@@ -18,9 +18,11 @@ KausaLayer is privacy infrastructure for Solana, powered by the Stealth Diffusio
 ## Features
 
 - **Stealth Addresses** — Each transfer uses a unique one-time address derived from the receiver's meta-address
-- **SPL Token Support** — Transfer any SPL token or Token-2022 token privately
+- **3-Hop Privacy Routing** — Transfers route through 3 ephemeral wallets before reaching stealth address
+- **Private Swap** — Swap SOL to any token via Jupiter, delivered privately
 - **Client-Side Keys** — Private keys never leave the user's device
 - **Deterministic Derivation** — Receivers can derive stealth keypairs to claim funds
+- **Alias Support** — Human-readable addresses (kl_alice) for subscribers
 - **Low Fees** — 0.5% protocol fee + minimal Solana transaction fees
 
 ## How It Works
@@ -32,11 +34,13 @@ KausaLayer is privacy infrastructure for Solana, powered by the Stealth Diffusio
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        TRANSFER FLOW                             │
+│                     TRANSFER FLOW (3-Hop)                        │
 │  1. Sender requests transfer with recipient's meta-address       │
-│  2. Relay generates one-time deposit address                     │
+│  2. Relay generates deposit address + 2 intermediate hops        │
 │  3. Sender deposits SOL/tokens to deposit address                │
-│  4. Relay transfers to stealth address with ephemeral key memo   │
+│  4. TX1: Deposit → Hop1 (ephemeral)                              │
+│  5. TX2: Hop1 → Hop2 (ephemeral)                                 │
+│  6. TX3: Hop2 → Stealth Address (with ephemeral key memo)        │
 └─────────────────────────────────────────────────────────────────┘
                                │
                                ▼
@@ -47,6 +51,13 @@ KausaLayer is privacy infrastructure for Solana, powered by the Stealth Diffusio
 │  3. Receiver signs transaction and claims funds to any wallet    │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+## Security
+
+- **Ephemeral Keypairs** — All intermediate keys (deposit, hop1, hop2) auto-purged after 24 hours
+- **Encryption at Rest** — Keypairs encrypted with AES-256-GCM
+- **No Permanent Logs** — Transfer records deleted after claim
+- **Trustless Stealth** — Stealth address derived via ECDH, only recipient's view key can detect
 
 ## Protocol Details
 
@@ -94,12 +105,13 @@ curl -X POST https://api.kausalayer.com/transfer/request \
 
 - **Language:** Rust
 - **Blockchain:** Solana
-- **Cryptography:** Ed25519, SHA-256
+- **Cryptography:** Ed25519, SHA-256, AES-256-GCM
 
 ## Links
 
 - [Website](https://kausalayer.com)
 - [Documentation](https://docs.kausalayer.com)
+- [X (Twitter)](https://x.com/kausalayer)
 
 ## License
 

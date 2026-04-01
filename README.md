@@ -5,7 +5,11 @@
 
   **Private transfers on Solana using stealth addresses**
 
-  [Website](https://kausalayer.com) · [Documentation](https://docs.kausalayer.com) · [X (Twitter)](https://x.com/kausalayer)
+  [![Solana](https://img.shields.io/badge/Solana-Mainnet-9945FF?style=flat-square&logo=solana)](https://solana.com)
+  [![Rust](https://img.shields.io/badge/Rust-1.70+-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
+  [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+  [![Website](https://img.shields.io/badge/Website-kausalayer.com-teal?style=flat-square)](https://kausalayer.com)
+  [![Docs](https://img.shields.io/badge/Docs-docs.kausalayer.com-blue?style=flat-square)](https://docs.kausalayer.com)
 
 </div>
 

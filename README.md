@@ -13,7 +13,7 @@
 
 ## Overview
 
-KausaLayer is privacy infrastructure for Solana, powered by the Stealth Diffusion Protocol (SDP). It enables private transfers of SOL and SPL tokens using one-time stealth addresses that are unlinkable to the receiver's public identity.
+KausaLayer is privacy infrastructure for Solana, powered by the Stealth Diffusion Protocol (SDP). It enables private transfers of SOL using one-time stealth addresses that are unlinkable to the receiver's public identity.
 
 ## Features
 
@@ -23,6 +23,7 @@ KausaLayer is privacy infrastructure for Solana, powered by the Stealth Diffusio
 - **Client-Side Keys** — Private keys never leave the user's device
 - **Deterministic Derivation** — Receivers can derive stealth keypairs to claim funds
 - **Alias Support** — Human-readable addresses (kl_alice) for subscribers
+- **SOL Diversification** — Split SOL to multiple wallets privately (2-5 destinations)
 - **Low Fees** — 0.5% protocol fee + minimal Solana transaction fees
 
 ## How It Works
@@ -37,7 +38,7 @@ KausaLayer is privacy infrastructure for Solana, powered by the Stealth Diffusio
 │                     TRANSFER FLOW (3-Hop)                        │
 │  1. Sender requests transfer with recipient's meta-address       │
 │  2. Relay generates deposit address + 2 intermediate hops        │
-│  3. Sender deposits SOL/tokens to deposit address                │
+│  3. Sender deposits SOL to deposit address                │
 │  4. TX1: Deposit → Hop1 (ephemeral)                              │
 │  5. TX2: Hop1 → Hop2 (ephemeral)                                 │
 │  6. TX3: Hop2 → Stealth Address (with ephemeral key memo)        │

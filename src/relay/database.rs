@@ -134,6 +134,43 @@ pub struct AliasRecord {
     pub is_active: bool,
 }
 
+/// A diversification request
+#[derive(Debug, Clone)]
+pub struct DiversificationRequest {
+    pub request_id: String,
+    pub meta_address: String,
+    pub deposit_address: String,
+    pub total_amount: u64,
+    pub fee_amount: u64,
+    pub network_fee: u64,
+    pub distribution_mode: String,
+    pub status: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub funded_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+/// A diversification route
+#[derive(Debug, Clone)]
+pub struct DiversificationRoute {
+    pub id: i64,
+    pub request_id: String,
+    pub route_index: u8,
+    pub destination_slot: u8,
+    pub destination_wallet: String,
+    pub amount: u64,
+    pub percentage: Option<f64>,
+    pub hop1_address: Option<String>,
+    pub hop2_address: Option<String>,
+    pub status: String,
+    pub tx1_signature: Option<String>,
+    pub tx2_signature: Option<String>,
+    pub tx3_signature: Option<String>,
+    pub error_message: Option<String>,
+    pub completed_at: Option<i64>,
+}
+
 /// Database wrapper for relay
 pub struct RelayDatabase {
     conn: Mutex<Connection>,
@@ -384,6 +421,66 @@ impl RelayDatabase {
             )",
             [],
         ).map_err(|e| format!("Failed to create destination_wallets table: {}", e))?;
+
+        // ============ DIVERSIFICATION TABLES ============
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS diversification_requests (
+                request_id              TEXT PRIMARY KEY,
+                meta_address            TEXT NOT NULL,
+                deposit_address         TEXT NOT NULL,
+                deposit_keypair_encrypted BLOB NOT NULL,
+                total_amount            INTEGER NOT NULL,
+                fee_amount              INTEGER NOT NULL,
+                network_fee             INTEGER NOT NULL,
+                distribution_mode       TEXT NOT NULL,
+                status                  TEXT NOT NULL DEFAULT 'pending',
+                created_at              INTEGER NOT NULL,
+                expires_at              INTEGER NOT NULL,
+                funded_at               INTEGER,
+                completed_at            INTEGER
+            )",
+            [],
+        ).map_err(|e| format!("Failed to create diversification_requests table: {}", e))?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_div_requests_status ON diversification_requests(status)",
+            [],
+        ).map_err(|e| format!("Failed to create div_requests_status index: {}", e))?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_div_requests_expires ON diversification_requests(expires_at)",
+            [],
+        ).map_err(|e| format!("Failed to create div_requests_expires index: {}", e))?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS diversification_routes (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id              TEXT NOT NULL,
+                route_index             INTEGER NOT NULL,
+                destination_slot        INTEGER NOT NULL,
+                destination_wallet      TEXT NOT NULL,
+                amount                  INTEGER NOT NULL,
+                percentage              REAL,
+                hop1_address            TEXT,
+                hop1_keypair_encrypted  BLOB,
+                hop2_address            TEXT,
+                hop2_keypair_encrypted  BLOB,
+                status                  TEXT NOT NULL DEFAULT 'pending',
+                tx1_signature           TEXT,
+                tx2_signature           TEXT,
+                tx3_signature           TEXT,
+                error_message           TEXT,
+                completed_at            INTEGER,
+                FOREIGN KEY (request_id) REFERENCES diversification_requests(request_id)
+            )",
+            [],
+        ).map_err(|e| format!("Failed to create diversification_routes table: {}", e))?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_div_routes_request ON diversification_routes(request_id)",
+            [],
+        ).map_err(|e| format!("Failed to create div_routes_request index: {}", e))?;
         Ok(())
     }
 
@@ -1417,8 +1514,8 @@ impl RelayDatabase {
 
     /// Add or update destination wallet
     pub fn add_destination_wallet(&self, owner_meta_hash: &str, slot: u8, wallet_address: &str) -> Result<(), String> {
-        if slot < 1 || slot > 3 {
-            return Err("Slot must be 1, 2, or 3".to_string());
+        if slot < 1 || slot > 5 {
+            return Err("Slot must be 1, 2, 3, 4, or 5".to_string());
         }
         let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
         let now = chrono::Utc::now().timestamp();
@@ -1457,6 +1554,382 @@ impl RelayDatabase {
             }
         }
         Ok(wallets)
+    }
+
+    // ============ DIVERSIFICATION FUNCTIONS ============
+
+    /// Create a new diversification request
+    pub fn create_diversification_request(
+        &self,
+        request_id: &str,
+        meta_address: &str,
+        total_amount: u64,
+        fee_amount: u64,
+        network_fee: u64,
+        distribution_mode: &str,
+        expires_in_secs: i64,
+    ) -> Result<(DiversificationRequest, Keypair), String> {
+        let keypair = Keypair::new();
+        let deposit_address = keypair.pubkey().to_string();
+        let keypair_bytes = keypair.to_bytes();
+        let encrypted_keypair = self.encrypt_keypair(&keypair_bytes)?;
+
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + expires_in_secs;
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO diversification_requests (
+                request_id, meta_address, deposit_address, deposit_keypair_encrypted,
+                total_amount, fee_amount, network_fee, distribution_mode,
+                status, created_at, expires_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10)",
+            params![
+                request_id,
+                meta_address,
+                deposit_address,
+                encrypted_keypair,
+                total_amount as i64,
+                fee_amount as i64,
+                network_fee as i64,
+                distribution_mode,
+                now,
+                expires_at,
+            ],
+        ).map_err(|e| format!("Failed to create diversification request: {}", e))?;
+
+        let request = DiversificationRequest {
+            request_id: request_id.to_string(),
+            meta_address: meta_address.to_string(),
+            deposit_address,
+            total_amount,
+            fee_amount,
+            network_fee,
+            distribution_mode: distribution_mode.to_string(),
+            status: "pending".to_string(),
+            created_at: now,
+            expires_at,
+            funded_at: None,
+            completed_at: None,
+        };
+
+        Ok((request, keypair))
+    }
+
+    /// Add a route to a diversification request
+    pub fn add_diversification_route(
+        &self,
+        request_id: &str,
+        route_index: u8,
+        destination_slot: u8,
+        destination_wallet: &str,
+        amount: u64,
+        percentage: Option<f64>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO diversification_routes (
+                request_id, route_index, destination_slot, destination_wallet,
+                amount, percentage, status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+            params![
+                request_id,
+                route_index as i64,
+                destination_slot as i64,
+                destination_wallet,
+                amount as i64,
+                percentage,
+            ],
+        ).map_err(|e| format!("Failed to add diversification route: {}", e))?;
+        Ok(())
+    }
+
+    /// Get diversification request by ID
+    pub fn get_diversification_request(&self, request_id: &str) -> Result<Option<DiversificationRequest>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT request_id, meta_address, deposit_address, total_amount, fee_amount,
+                    network_fee, distribution_mode, status, created_at, expires_at,
+                    funded_at, completed_at
+             FROM diversification_requests WHERE request_id = ?1"
+        ).map_err(|e| format!("Prepare error: {}", e))?;
+
+        let result = stmt.query_row(params![request_id], |row| {
+            Ok(DiversificationRequest {
+                request_id: row.get(0)?,
+                meta_address: row.get(1)?,
+                deposit_address: row.get(2)?,
+                total_amount: row.get::<_, i64>(3)? as u64,
+                fee_amount: row.get::<_, i64>(4)? as u64,
+                network_fee: row.get::<_, i64>(5)? as u64,
+                distribution_mode: row.get(6)?,
+                status: row.get(7)?,
+                created_at: row.get(8)?,
+                expires_at: row.get(9)?,
+                funded_at: row.get(10)?,
+                completed_at: row.get(11)?,
+            })
+        });
+
+        match result {
+            Ok(req) => Ok(Some(req)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Query error: {}", e)),
+        }
+    }
+
+    /// Get diversification deposit keypair
+    pub fn get_diversification_keypair(&self, request_id: &str) -> Result<Keypair, String> {
+        let conn = self.conn.lock().unwrap();
+        let encrypted: Vec<u8> = conn.query_row(
+            "SELECT deposit_keypair_encrypted FROM diversification_requests WHERE request_id = ?1",
+            params![request_id],
+            |row| row.get(0),
+        ).map_err(|e| format!("Query error: {}", e))?;
+
+        let decrypted = self.decrypt_keypair(&encrypted)?;
+        if decrypted.len() != 64 {
+            return Err("Invalid keypair length".to_string());
+        }
+
+        let mut bytes = [0u8; 64];
+        bytes.copy_from_slice(&decrypted);
+        Keypair::from_bytes(&bytes).map_err(|e| format!("Invalid keypair: {}", e))
+    }
+
+    /// Get all routes for a diversification request
+    pub fn get_diversification_routes(&self, request_id: &str) -> Result<Vec<DiversificationRoute>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, request_id, route_index, destination_slot, destination_wallet,
+                    amount, percentage, hop1_address, hop2_address, status,
+                    tx1_signature, tx2_signature, tx3_signature, error_message, completed_at
+             FROM diversification_routes WHERE request_id = ?1 ORDER BY route_index"
+        ).map_err(|e| format!("Prepare error: {}", e))?;
+
+        let rows = stmt.query_map(params![request_id], |row| {
+            Ok(DiversificationRoute {
+                id: row.get(0)?,
+                request_id: row.get(1)?,
+                route_index: row.get::<_, i64>(2)? as u8,
+                destination_slot: row.get::<_, i64>(3)? as u8,
+                destination_wallet: row.get(4)?,
+                amount: row.get::<_, i64>(5)? as u64,
+                percentage: row.get(6)?,
+                hop1_address: row.get(7)?,
+                hop2_address: row.get(8)?,
+                status: row.get(9)?,
+                tx1_signature: row.get(10)?,
+                tx2_signature: row.get(11)?,
+                tx3_signature: row.get(12)?,
+                error_message: row.get(13)?,
+                completed_at: row.get(14)?,
+            })
+        }).map_err(|e| format!("Query error: {}", e))?;
+
+        let mut routes = Vec::new();
+        for row in rows {
+            routes.push(row.map_err(|e| format!("Row error: {}", e))?);
+        }
+        Ok(routes)
+    }
+
+    /// Update diversification request status
+    pub fn update_diversification_status(&self, request_id: &str, status: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let update_field = match status {
+            "funded" => "funded_at",
+            "completed" => "completed_at",
+            _ => "",
+        };
+
+        if !update_field.is_empty() {
+            conn.execute(
+                &format!("UPDATE diversification_requests SET status = ?1, {} = ?2 WHERE request_id = ?3", update_field),
+                params![status, now, request_id],
+            ).map_err(|e| format!("Update error: {}", e))?;
+        } else {
+            conn.execute(
+                "UPDATE diversification_requests SET status = ?1 WHERE request_id = ?2",
+                params![status, request_id],
+            ).map_err(|e| format!("Update error: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Update route with hop keypairs
+    pub fn update_route_keypairs(
+        &self,
+        route_id: i64,
+        hop1_address: &str,
+        hop1_keypair_bytes: &[u8],
+        hop2_address: &str,
+        hop2_keypair_bytes: &[u8],
+    ) -> Result<(), String> {
+        let hop1_encrypted = self.encrypt_keypair(hop1_keypair_bytes)?;
+        let hop2_encrypted = self.encrypt_keypair(hop2_keypair_bytes)?;
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE diversification_routes SET
+                hop1_address = ?1, hop1_keypair_encrypted = ?2,
+                hop2_address = ?3, hop2_keypair_encrypted = ?4
+             WHERE id = ?5",
+            params![hop1_address, hop1_encrypted, hop2_address, hop2_encrypted, route_id],
+        ).map_err(|e| format!("Update error: {}", e))?;
+        Ok(())
+    }
+
+    /// Get route hop keypair
+    pub fn get_route_hop_keypair(&self, route_id: i64, hop_index: u8) -> Result<Keypair, String> {
+        let conn = self.conn.lock().unwrap();
+        let column = if hop_index == 1 { "hop1_keypair_encrypted" } else { "hop2_keypair_encrypted" };
+
+        let encrypted: Vec<u8> = conn.query_row(
+            &format!("SELECT {} FROM diversification_routes WHERE id = ?1", column),
+            params![route_id],
+            |row| row.get(0),
+        ).map_err(|e| format!("Query error: {}", e))?;
+
+        let decrypted = self.decrypt_keypair(&encrypted)?;
+        if decrypted.len() != 64 {
+            return Err("Invalid keypair length".to_string());
+        }
+
+        let mut bytes = [0u8; 64];
+        bytes.copy_from_slice(&decrypted);
+        Keypair::from_bytes(&bytes).map_err(|e| format!("Invalid keypair: {}", e))
+    }
+
+    /// Update route status
+    pub fn update_route_status(&self, route_id: i64, status: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        if status == "completed" {
+            conn.execute(
+                "UPDATE diversification_routes SET status = ?1, completed_at = ?2 WHERE id = ?3",
+                params![status, now, route_id],
+            ).map_err(|e| format!("Update error: {}", e))?;
+        } else {
+            conn.execute(
+                "UPDATE diversification_routes SET status = ?1 WHERE id = ?2",
+                params![status, route_id],
+            ).map_err(|e| format!("Update error: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Update route with transaction signature
+    pub fn update_route_tx(&self, route_id: i64, tx_index: u8, signature: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let column = match tx_index {
+            1 => "tx1_signature",
+            2 => "tx2_signature",
+            3 => "tx3_signature",
+            _ => return Err("Invalid tx_index".to_string()),
+        };
+
+        conn.execute(
+            &format!("UPDATE diversification_routes SET {} = ?1 WHERE id = ?2", column),
+            params![signature, route_id],
+        ).map_err(|e| format!("Update error: {}", e))?;
+        Ok(())
+    }
+
+    /// Update route with error message
+    pub fn update_route_error(&self, route_id: i64, error: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE diversification_routes SET status = 'failed', error_message = ?1 WHERE id = ?2",
+            params![error, route_id],
+        ).map_err(|e| format!("Update error: {}", e))?;
+        Ok(())
+    }
+
+    /// Get pending diversification requests (for polling)
+    pub fn get_pending_diversification_requests(&self) -> Result<Vec<DiversificationRequest>, String> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let mut stmt = conn.prepare(
+            "SELECT request_id, meta_address, deposit_address, total_amount, fee_amount,
+                    network_fee, distribution_mode, status, created_at, expires_at,
+                    funded_at, completed_at
+             FROM diversification_requests
+             WHERE status = 'pending' AND expires_at > ?1"
+        ).map_err(|e| format!("Prepare error: {}", e))?;
+
+        let rows = stmt.query_map(params![now], |row| {
+            Ok(DiversificationRequest {
+                request_id: row.get(0)?,
+                meta_address: row.get(1)?,
+                deposit_address: row.get(2)?,
+                total_amount: row.get::<_, i64>(3)? as u64,
+                fee_amount: row.get::<_, i64>(4)? as u64,
+                network_fee: row.get::<_, i64>(5)? as u64,
+                distribution_mode: row.get(6)?,
+                status: row.get(7)?,
+                created_at: row.get(8)?,
+                expires_at: row.get(9)?,
+                funded_at: row.get(10)?,
+                completed_at: row.get(11)?,
+            })
+        }).map_err(|e| format!("Query error: {}", e))?;
+
+        let mut requests = Vec::new();
+        for row in rows {
+            requests.push(row.map_err(|e| format!("Row error: {}", e))?);
+        }
+        Ok(requests)
+    }
+
+    /// Cleanup expired diversification requests
+    pub fn cleanup_expired_diversification(&self) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // First delete routes for expired requests
+        conn.execute(
+            "DELETE FROM diversification_routes WHERE request_id IN (
+                SELECT request_id FROM diversification_requests
+                WHERE status = 'pending' AND expires_at < ?1
+            )",
+            params![now],
+        ).map_err(|e| format!("Delete routes error: {}", e))?;
+
+        // Then delete the requests
+        let deleted = conn.execute(
+            "DELETE FROM diversification_requests WHERE status = 'pending' AND expires_at < ?1",
+            params![now],
+        ).map_err(|e| format!("Delete requests error: {}", e))?;
+
+        Ok(deleted)
+    }
+
+    /// Cleanup old completed diversification (24h)
+    pub fn cleanup_old_diversification(&self) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = chrono::Utc::now().timestamp() - 86400;
+
+        // Delete routes first
+        conn.execute(
+            "DELETE FROM diversification_routes WHERE request_id IN (
+                SELECT request_id FROM diversification_requests
+                WHERE status = 'completed' AND completed_at < ?1
+            )",
+            params![cutoff],
+        ).map_err(|e| format!("Delete routes error: {}", e))?;
+
+        // Then delete requests
+        let deleted = conn.execute(
+            "DELETE FROM diversification_requests WHERE status = 'completed' AND completed_at < ?1",
+            params![cutoff],
+        ).map_err(|e| format!("Delete requests error: {}", e))?;
+
+        Ok(deleted)
     }
 }
 

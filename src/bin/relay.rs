@@ -857,9 +857,9 @@ async fn execute_swap_transfer(
 
             // TX 6: Transfer remaining SOL to destination
             let remaining_sol = state.client.get_balance(&hop2_keypair.pubkey()).unwrap_or(0);
-            if remaining_sol > 5000 {
+            if remaining_sol > 900_000 {
                 let blockhash = state.client.get_latest_blockhash().unwrap();
-                let sol_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &destination_pubkey, remaining_sol - 5000);
+                let sol_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &destination_pubkey, remaining_sol - 900_000);
                 let tx6 = Transaction::new_signed_with_payer(
                     &[sol_ix],
                     Some(&hop2_keypair.pubkey()),
@@ -867,7 +867,7 @@ async fn execute_swap_transfer(
                     blockhash,
                 );
                 if let Ok(_) = state.client.send_and_confirm_transaction(&tx6) {
-                    info!("TX 6 success: remaining {} SOL sent to destination", lamports_to_sol(remaining_sol - 5000));
+                    info!("TX 6 success: remaining {} SOL sent to destination", lamports_to_sol(remaining_sol - 900_000));
                 }
             }
             state.db.mark_completed(request_id, &swap_sig.to_string()).ok();
@@ -953,9 +953,9 @@ async fn retry_swap(
 
             // Transfer remaining SOL to destination
             let remaining_sol = state.client.get_balance(&hop2_keypair.pubkey()).unwrap_or(0);
-            if remaining_sol > 5000 {
+            if remaining_sol > 900_000 {
                 let blockhash = state.client.get_latest_blockhash().unwrap();
-                let sol_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &destination_pubkey, remaining_sol - 5000);
+                let sol_ix = system_instruction::transfer(&hop2_keypair.pubkey(), &destination_pubkey, remaining_sol - 900_000);
                 let sol_tx = Transaction::new_signed_with_payer(
                     &[sol_ix],
                     Some(&hop2_keypair.pubkey()),
@@ -2071,6 +2071,669 @@ struct DestinationWallet {
     wallet_address: String,
 }
 
+
+// ============ DIVERSIFICATION STRUCTS ============
+
+#[derive(Debug, Deserialize)]
+struct DiversifyRouteInput {
+    slot: u8,
+    value: f64,  // percentage or fixed amount depending on mode
+}
+
+#[derive(Debug, Deserialize)]
+struct DiversifyRequest {
+    meta_address: String,
+    total_amount: f64,  // in SOL
+    distribution_mode: String,  // "equal", "percentage", "fixed"
+    routes: Vec<DiversifyRouteInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiversifyRouteOutput {
+    slot: u8,
+    wallet: String,
+    amount: f64,
+    percentage: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiversifyResponse {
+    success: bool,
+    request_id: Option<String>,
+    deposit_address: Option<String>,
+    deposit_amount: Option<f64>,
+    total_amount: Option<f64>,
+    fee: Option<f64>,
+    network_fee: Option<f64>,
+    routes: Option<Vec<DiversifyRouteOutput>>,
+    expires_in: Option<i64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiversifyStatusRequest {
+    request_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiversifyRouteStatus {
+    slot: u8,
+    status: String,
+    amount: f64,
+    signature: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiversifyStatusResponse {
+    request_id: String,
+    status: String,
+    is_funded: bool,
+    deposit_received: Option<f64>,
+    deposit_required: Option<f64>,
+    routes_completed: Option<u8>,
+    routes_total: Option<u8>,
+    routes: Option<Vec<DiversifyRouteStatus>>,
+    expires_at: Option<i64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiversifyExecuteRequest {
+    request_id: String,
+}
+
+// ============ DIVERSIFICATION HANDLERS ============
+
+async fn diversify_request(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<DiversifyRequest>,
+) -> Json<DiversifyResponse> {
+    info!("Diversify request: {} SOL, mode: {}, routes: {}", 
+          req.total_amount, req.distribution_mode, req.routes.len());
+
+    // Validation: minimum 1 SOL
+    if req.total_amount < 1.0 {
+        return Json(DiversifyResponse {
+            success: false,
+            error: Some("Minimum deposit is 1 SOL".to_string()),
+            ..Default::default()
+        });
+    }
+
+    // Validation: max 5 destinations
+    if req.routes.len() > 5 {
+        return Json(DiversifyResponse {
+            success: false,
+            error: Some("Maximum 5 destinations allowed".to_string()),
+            ..Default::default()
+        });
+    }
+
+    // Validation: at least 2 destinations
+    if req.routes.len() < 2 {
+        return Json(DiversifyResponse {
+            success: false,
+            error: Some("Minimum 2 destinations required".to_string()),
+            ..Default::default()
+        });
+    }
+
+    // Hash meta address
+    let mut hasher = Sha256::new();
+    hasher.update(req.meta_address.as_bytes());
+    let owner_hash = format!("{:x}", hasher.finalize());
+
+    // Get destination wallets
+    let wallets = match state.db.list_destination_wallets(&owner_hash) {
+        Ok(w) => w,
+        Err(e) => {
+            return Json(DiversifyResponse {
+                success: false,
+                error: Some(format!("Failed to get wallets: {}", e)),
+                ..Default::default()
+            });
+        }
+    };
+
+    let wallet_map: std::collections::HashMap<u8, String> = wallets.into_iter().collect();
+
+    // Validate all slots exist
+    for route in &req.routes {
+        if !wallet_map.contains_key(&route.slot) {
+            return Json(DiversifyResponse {
+                success: false,
+                error: Some(format!("Slot {} is empty. Please add wallet first.", route.slot)),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Calculate distribution
+    let total_lamports = sol_to_lamports(req.total_amount);
+    let mut route_amounts: Vec<(u8, String, u64, Option<f64>)> = Vec::new();
+
+    match req.distribution_mode.as_str() {
+        "equal" => {
+            let amount_each = total_lamports / req.routes.len() as u64;
+            for route in &req.routes {
+                let wallet = wallet_map.get(&route.slot).unwrap().clone();
+                let pct = 100.0 / req.routes.len() as f64;
+                route_amounts.push((route.slot, wallet, amount_each, Some(pct)));
+            }
+        },
+        "percentage" => {
+            let total_pct: f64 = req.routes.iter().map(|r| r.value).sum();
+            if (total_pct - 100.0).abs() > 0.01 {
+                return Json(DiversifyResponse {
+                    success: false,
+                    error: Some(format!("Percentages must total 100% (got {}%)", total_pct)),
+                    ..Default::default()
+                });
+            }
+            for route in &req.routes {
+                let wallet = wallet_map.get(&route.slot).unwrap().clone();
+                let amount = ((total_lamports as f64) * (route.value / 100.0)) as u64;
+                route_amounts.push((route.slot, wallet, amount, Some(route.value)));
+            }
+        },
+        "fixed" => {
+            let total_fixed: f64 = req.routes.iter().map(|r| r.value).sum();
+            if (total_fixed - req.total_amount).abs() > 0.001 {
+                return Json(DiversifyResponse {
+                    success: false,
+                    error: Some(format!("Fixed amounts must total {} SOL (got {} SOL)", 
+                                       req.total_amount, total_fixed)),
+                    ..Default::default()
+                });
+            }
+            for route in &req.routes {
+                let wallet = wallet_map.get(&route.slot).unwrap().clone();
+                let amount = sol_to_lamports(route.value);
+                route_amounts.push((route.slot, wallet, amount, None));
+            }
+        },
+        _ => {
+            return Json(DiversifyResponse {
+                success: false,
+                error: Some("Invalid distribution mode. Use: equal, percentage, or fixed".to_string()),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Check if subscriber (fee waiver)
+    let is_subscriber = state.db.is_subscribed(&req.meta_address).unwrap_or(false);
+    let fee_lamports = if is_subscriber {
+        info!("Subscriber detected - fee waived");
+        0
+    } else {
+        ((total_lamports as f64) * FEE_PERCENT / 100.0) as u64
+    };
+
+    // Network fee: 3 transactions per route (deposit->hop1, hop1->hop2, hop2->dest)
+    // Network fee: 3 tx per route + rent buffer + safety buffer
+    let network_fee = TX_FEE_LAMPORTS * 3 * route_amounts.len() as u64 + 1_500_000;
+    let total_deposit = total_lamports + fee_lamports + network_fee;
+
+    // Create request
+    let request_id = format!("div_{}", chrono::Utc::now().timestamp_millis());
+    
+    let (div_request, _keypair) = match state.db.create_diversification_request(
+        &request_id,
+        &req.meta_address,
+        total_lamports,
+        fee_lamports,
+        network_fee,
+        &req.distribution_mode,
+        EXPIRY_SECONDS,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(DiversifyResponse {
+                success: false,
+                error: Some(format!("Failed to create request: {}", e)),
+                ..Default::default()
+            });
+        }
+    };
+
+    // Add routes
+    for (idx, (slot, wallet, amount, pct)) in route_amounts.iter().enumerate() {
+        if let Err(e) = state.db.add_diversification_route(
+            &request_id,
+            idx as u8,
+            *slot,
+            wallet,
+            *amount,
+            *pct,
+        ) {
+            error!("Failed to add route: {}", e);
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let routes_output: Vec<DiversifyRouteOutput> = route_amounts.iter()
+        .map(|(slot, wallet, amount, pct)| DiversifyRouteOutput {
+            slot: *slot,
+            wallet: wallet.clone(),
+            amount: lamports_to_sol(*amount),
+            percentage: *pct,
+        })
+        .collect();
+
+    info!("Created diversification request {} with {} routes", request_id, routes_output.len());
+
+    Json(DiversifyResponse {
+        success: true,
+        request_id: Some(request_id),
+        deposit_address: Some(div_request.deposit_address),
+        deposit_amount: Some(lamports_to_sol(total_deposit)),
+        total_amount: Some(req.total_amount),
+        fee: Some(lamports_to_sol(fee_lamports)),
+        network_fee: Some(lamports_to_sol(network_fee)),
+        routes: Some(routes_output),
+        expires_in: Some(div_request.expires_at - now),
+        error: None,
+    })
+}
+
+impl Default for DiversifyResponse {
+    fn default() -> Self {
+        Self {
+            success: false,
+            request_id: None,
+            deposit_address: None,
+            deposit_amount: None,
+            total_amount: None,
+            fee: None,
+            network_fee: None,
+            routes: None,
+            expires_in: None,
+            error: None,
+        }
+    }
+}
+
+async fn diversify_status(
+    State(state): State<Arc<RelayState>>,
+    Query(req): Query<DiversifyStatusRequest>,
+) -> Json<DiversifyStatusResponse> {
+    let request = match state.db.get_diversification_request(&req.request_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Json(DiversifyStatusResponse {
+                request_id: req.request_id,
+                status: "not_found".to_string(),
+                is_funded: false,
+                deposit_received: None,
+                deposit_required: None,
+                routes_completed: None,
+                routes_total: None,
+                routes: None,
+                expires_at: None,
+                error: Some("Request not found".to_string()),
+            });
+        },
+        Err(e) => {
+            return Json(DiversifyStatusResponse {
+                request_id: req.request_id,
+                status: "error".to_string(),
+                is_funded: false,
+                deposit_received: None,
+                deposit_required: None,
+                routes_completed: None,
+                routes_total: None,
+                routes: None,
+                expires_at: None,
+                error: Some(format!("Database error: {}", e)),
+            });
+        }
+    };
+
+    // Check deposit balance
+    let deposit_pubkey = match Pubkey::from_str(&request.deposit_address) {
+        Ok(p) => p,
+        Err(_) => {
+            return Json(DiversifyStatusResponse {
+                request_id: req.request_id,
+                status: "error".to_string(),
+                is_funded: false,
+                deposit_received: None,
+                deposit_required: None,
+                routes_completed: None,
+                routes_total: None,
+                routes: None,
+                expires_at: None,
+                error: Some("Invalid deposit address".to_string()),
+            });
+        }
+    };
+
+    let balance = state.client.get_balance(&deposit_pubkey).unwrap_or(0);
+    let required = request.total_amount + request.fee_amount + request.network_fee;
+    let is_funded = balance >= required;
+
+    // Get routes
+    let routes = match state.db.get_diversification_routes(&req.request_id) {
+        Ok(r) => r,
+        Err(_) => vec![],
+    };
+
+    let routes_completed = routes.iter().filter(|r| r.status == "completed").count() as u8;
+    let routes_total = routes.len() as u8;
+
+    let route_statuses: Vec<DiversifyRouteStatus> = routes.iter()
+        .map(|r| DiversifyRouteStatus {
+            slot: r.destination_slot,
+            status: r.status.clone(),
+            amount: lamports_to_sol(r.amount),
+            signature: r.tx3_signature.clone(),
+            error: r.error_message.clone(),
+        })
+        .collect();
+
+    Json(DiversifyStatusResponse {
+        request_id: request.request_id,
+        status: request.status,
+        is_funded,
+        deposit_received: Some(lamports_to_sol(balance)),
+        deposit_required: Some(lamports_to_sol(required)),
+        routes_completed: Some(routes_completed),
+        routes_total: Some(routes_total),
+        routes: Some(route_statuses),
+        expires_at: Some(request.expires_at),
+        error: None,
+    })
+}
+
+async fn diversify_execute(
+    State(state): State<Arc<RelayState>>,
+    Json(req): Json<DiversifyExecuteRequest>,
+) -> Json<serde_json::Value> {
+    info!("Execute diversification: {}", req.request_id);
+
+    // Get request
+    let request = match state.db.get_diversification_request(&req.request_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": "Request not found"
+            }));
+        },
+        Err(e) => {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": format!("Database error: {}", e)
+            }));
+        }
+    };
+
+    // Check status
+    if request.status != "pending" && request.status != "funded" {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Request status is '{}', cannot execute", request.status)
+        }));
+    }
+
+    // Get deposit keypair
+    let deposit_keypair = match state.db.get_diversification_keypair(&req.request_id) {
+        Ok(k) => k,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to get keypair: {}", e)
+            }));
+        }
+    };
+
+    // Check balance
+    let balance = state.client.get_balance(&deposit_keypair.pubkey()).unwrap_or(0);
+    let required = request.total_amount + request.fee_amount + request.network_fee;
+
+    if balance < required {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Insufficient deposit: {} < {} SOL required", 
+                           lamports_to_sol(balance), lamports_to_sol(required))
+        }));
+    }
+
+    // Mark as funded if not already
+    if request.status == "pending" {
+        state.db.update_diversification_status(&req.request_id, "funded").ok();
+    }
+
+    // Get routes
+    let routes = match state.db.get_diversification_routes(&req.request_id) {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to get routes: {}", e)
+            }));
+        }
+    };
+
+    // Update status to processing
+    state.db.update_diversification_status(&req.request_id, "processing").ok();
+
+    // Deduct fee first (if any)
+    if request.fee_amount > 0 {
+        let blockhash = match state.client.get_latest_blockhash() {
+            Ok(b) => b,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Blockhash error: {}", e)
+                }));
+            }
+        };
+
+        let fee_ix = system_instruction::transfer(
+            &deposit_keypair.pubkey(),
+            &state.fee_wallet,
+            request.fee_amount,
+        );
+
+        let fee_tx = Transaction::new_signed_with_payer(
+            &[fee_ix],
+            Some(&deposit_keypair.pubkey()),
+            &[&deposit_keypair],
+            blockhash,
+        );
+
+        if let Err(e) = state.client.send_and_confirm_transaction(&fee_tx) {
+            error!("Fee transfer failed: {}", e);
+            // Continue anyway, fee collection is best-effort
+        } else {
+            info!("Fee collected: {} SOL", lamports_to_sol(request.fee_amount));
+        }
+    }
+
+    // Execute routes sequentially
+    let mut completed = 0;
+    let mut failed = 0;
+    let total_routes = routes.len();
+
+    for (route_idx, route) in routes.into_iter().enumerate() {
+        let is_last_route = route_idx == total_routes - 1;
+        
+        info!("Executing route {} -> slot {} ({} SOL) [last={}]", 
+              route.route_index, route.destination_slot, lamports_to_sol(route.amount), is_last_route);
+
+        state.db.update_route_status(route.id, "processing").ok();
+
+        // Generate hop keypairs
+        let hop1 = solana_sdk::signature::Keypair::new();
+        let hop2 = solana_sdk::signature::Keypair::new();
+
+        // Save hop keypairs
+        state.db.update_route_keypairs(
+            route.id,
+            &hop1.pubkey().to_string(),
+            &hop1.to_bytes(),
+            &hop2.pubkey().to_string(),
+            &hop2.to_bytes(),
+        ).ok();
+
+        // Calculate amounts - last route takes remaining balance
+        let (amount_for_hop1, actual_route_amount) = if is_last_route {
+            // Get remaining balance from deposit address
+            let deposit_balance = state.client.get_balance(&deposit_keypair.pubkey()).unwrap_or(0);
+            // Reserve for TX1 fee only (TX2 and TX3 fees come from hop amounts)
+            let available = deposit_balance.saturating_sub(TX_FEE_LAMPORTS);
+            // amount_for_hop1 includes TX2 and TX3 fees
+            let hop1_amount = available;
+            // actual amount to destination = hop1 - 2*TX_FEE
+            let dest_amount = hop1_amount.saturating_sub(TX_FEE_LAMPORTS * 2);
+            info!("Last route: deposit_balance={}, available={}, dest_amount={}", 
+                  deposit_balance, available, dest_amount);
+            (hop1_amount, dest_amount)
+        } else {
+            (route.amount + TX_FEE_LAMPORTS * 2, route.amount)
+        };
+        let amount_for_hop2 = actual_route_amount + TX_FEE_LAMPORTS;
+
+        // TX1: deposit -> hop1
+        let blockhash = match state.client.get_latest_blockhash() {
+            Ok(b) => b,
+            Err(e) => {
+                state.db.update_route_error(route.id, &format!("Blockhash error: {}", e)).ok();
+                failed += 1;
+                continue;
+            }
+        };
+
+        let tx1_ix = system_instruction::transfer(
+            &deposit_keypair.pubkey(),
+            &hop1.pubkey(),
+            amount_for_hop1,
+        );
+
+        let tx1 = Transaction::new_signed_with_payer(
+            &[tx1_ix],
+            Some(&deposit_keypair.pubkey()),
+            &[&deposit_keypair],
+            blockhash,
+        );
+
+        let tx1_sig = match state.client.send_and_confirm_transaction(&tx1) {
+            Ok(s) => {
+                state.db.update_route_tx(route.id, 1, &s.to_string()).ok();
+                s
+            },
+            Err(e) => {
+                state.db.update_route_error(route.id, &format!("TX1 failed: {}", e)).ok();
+                failed += 1;
+                continue;
+            }
+        };
+        info!("TX1 success: {}", tx1_sig);
+
+        // TX2: hop1 -> hop2
+        let blockhash = match state.client.get_latest_blockhash() {
+            Ok(b) => b,
+            Err(e) => {
+                state.db.update_route_error(route.id, &format!("Blockhash error: {}", e)).ok();
+                failed += 1;
+                continue;
+            }
+        };
+
+        let tx2_ix = system_instruction::transfer(
+            &hop1.pubkey(),
+            &hop2.pubkey(),
+            amount_for_hop2,
+        );
+
+        let tx2 = Transaction::new_signed_with_payer(
+            &[tx2_ix],
+            Some(&hop1.pubkey()),
+            &[&hop1],
+            blockhash,
+        );
+
+        let tx2_sig = match state.client.send_and_confirm_transaction(&tx2) {
+            Ok(s) => {
+                state.db.update_route_tx(route.id, 2, &s.to_string()).ok();
+                s
+            },
+            Err(e) => {
+                state.db.update_route_error(route.id, &format!("TX2 failed: {}", e)).ok();
+                failed += 1;
+                continue;
+            }
+        };
+        info!("TX2 success: {}", tx2_sig);
+
+        // TX3: hop2 -> destination
+        let blockhash = match state.client.get_latest_blockhash() {
+            Ok(b) => b,
+            Err(e) => {
+                state.db.update_route_error(route.id, &format!("Blockhash error: {}", e)).ok();
+                failed += 1;
+                continue;
+            }
+        };
+
+        let dest_pubkey = match Pubkey::from_str(&route.destination_wallet) {
+            Ok(p) => p,
+            Err(e) => {
+                state.db.update_route_error(route.id, &format!("Invalid destination: {}", e)).ok();
+                failed += 1;
+                continue;
+            }
+        };
+
+        let tx3_ix = system_instruction::transfer(
+            &hop2.pubkey(),
+            &dest_pubkey,
+            actual_route_amount,
+        );
+
+        let tx3 = Transaction::new_signed_with_payer(
+            &[tx3_ix],
+            Some(&hop2.pubkey()),
+            &[&hop2],
+            blockhash,
+        );
+
+        match state.client.send_and_confirm_transaction(&tx3) {
+            Ok(s) => {
+                state.db.update_route_tx(route.id, 3, &s.to_string()).ok();
+                state.db.update_route_status(route.id, "completed").ok();
+                info!("TX3 success: {} -> route {} complete", s, route.route_index);
+                completed += 1;
+            },
+            Err(e) => {
+                state.db.update_route_error(route.id, &format!("TX3 failed: {}", e)).ok();
+                failed += 1;
+            }
+        };
+    }
+
+    // Update final status
+    let final_status = if failed == 0 {
+        "completed"
+    } else if completed == 0 {
+        "failed"
+    } else {
+        "partial"
+    };
+
+    state.db.update_diversification_status(&req.request_id, final_status).ok();
+
+    Json(serde_json::json!({
+        "success": failed == 0,
+        "status": final_status,
+        "routes_completed": completed,
+        "routes_failed": failed,
+        "message": format!("{}/{} routes completed", completed, completed + failed)
+    }))
+}
 async fn add_destination_wallet(
     State(state): State<Arc<RelayState>>,
     Json(req): Json<AddDestinationRequest>,
@@ -2466,6 +3129,10 @@ async fn main() {
         .route("/wallet/destination/add", post(add_destination_wallet))
         .route("/wallet/destination/delete", post(delete_destination_wallet))
         .route("/wallet/destination/list", get(list_destination_wallets))
+        // Diversification routes
+        .route("/transfer/diversify/request", post(diversify_request))
+        .route("/transfer/diversify/status", get(diversify_status))
+        .route("/transfer/diversify/execute", post(diversify_execute))
         .route("/swap/request", post(request_swap))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .with_state(state.clone());
